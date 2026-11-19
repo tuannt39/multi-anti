@@ -1,0 +1,6 @@
+/multi-anti
+/multi-anti.exe
+*.out
+*.test
+/.tmp/
+/dist/

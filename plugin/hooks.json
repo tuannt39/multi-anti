@@ -1,0 +1,19 @@
+{
+  "multi-anti": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "multi-anti hook session-start",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "multi-anti hook stop",
+        "timeout": 15
+      }
+    ]
+  }
+}

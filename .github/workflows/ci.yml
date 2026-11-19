@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Run tests (Linux with race detector)
+        if: runner.os == 'Linux'
+        run: go test -race -count=1 ./...
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: go test -count=1 ./...
+
+  build-check:
+    name: Cross-compile Linux and Windows binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build target matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="${RUNNER_TEMP}/build-check"
+          mkdir -p "$out_dir"
+          for target in linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            ext=""
+            if [[ "$os" == "windows" ]]; then
+              ext=".exe"
+            fi
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -o "${out_dir}/multi-anti-${os}-${arch}${ext}" .
+          done
+          ls -lh "$out_dir"
