@@ -1010,8 +1010,21 @@ func TestInstallerPluginAndStatusLine(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(hooksRaw), "hook session-start") || !strings.Contains(string(hooksRaw), binWithSpace) {
-			t.Fatalf("unexpected hooks.json: %s", hooksRaw)
+		var hooksDoc map[string]hookPluginSpec
+		if err := json.Unmarshal(hooksRaw, &hooksDoc); err != nil {
+			t.Fatalf("parse hooks.json error = %v\nraw=%s", err, hooksRaw)
+		}
+		spec, ok := hooksDoc[pluginName]
+		if !ok || !spec.Enabled {
+			t.Fatalf("unexpected multi-anti hook spec: %+v (ok=%v)", spec, ok)
+		}
+		wantStart := quoteCommand(binWithSpace, "hook session-start")
+		wantStop := quoteCommand(binWithSpace, "hook stop")
+		if len(spec.SessionStart) != 1 || spec.SessionStart[0].Command != wantStart {
+			t.Fatalf("SessionStart = %+v, want command %q", spec.SessionStart, wantStart)
+		}
+		if len(spec.Stop) != 1 || spec.Stop[0].Command != wantStop {
+			t.Fatalf("Stop = %+v, want command %q", spec.Stop, wantStop)
 		}
 
 		cfgRaw, err := os.ReadFile(cfgPath)
@@ -1115,6 +1128,21 @@ func TestInstallerPluginAndStatusLine(t *testing.T) {
 		}
 		if got := quoteCommandForOS("windows", `C:\Program Files\multi-anti.exe`, "statusline"); got != `"C:\Program Files\multi-anti.exe" statusline` {
 			t.Fatalf("windows quote = %q", got)
+		}
+		winQuoted := quoteCommandForOS("windows", `C:\Users\runner\my bin\multi-anti.exe`, "hook stop")
+		if winQuoted != `"C:\Users\runner\my bin\multi-anti.exe" hook stop` {
+			t.Fatalf("windows quote with backslash/space = %q", winQuoted)
+		}
+		rawHandler, err := json.Marshal(hookCommandHandler{Type: "command", Command: winQuoted, Timeout: 15})
+		if err != nil {
+			t.Fatalf("marshal hookCommandHandler error = %v", err)
+		}
+		var decodedHandler hookCommandHandler
+		if err := json.Unmarshal(rawHandler, &decodedHandler); err != nil {
+			t.Fatalf("unmarshal hookCommandHandler error = %v", err)
+		}
+		if decodedHandler.Command != winQuoted {
+			t.Fatalf("decoded JSON command = %q, want %q", decodedHandler.Command, winQuoted)
 		}
 	})
 }
