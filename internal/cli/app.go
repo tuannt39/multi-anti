@@ -1903,6 +1903,10 @@ func (a *App) cmdRemove(ctx context.Context, args []string) int {
 		if resErr != nil {
 			return resErr
 		}
+		acc := s.Accounts[k]
+		if rmTokErr := removeNativeTokenIfMatches(paths.NativeAgyTokenPath(), k, acc.Email); rmTokErr != nil {
+			return rmTokErr
+		}
 		targetKey = k
 		delete(s.Accounts, k)
 		if s.ActiveKey == k {
@@ -1919,6 +1923,29 @@ func (a *App) cmdRemove(ctx context.Context, args []string) int {
 	}
 	fmt.Fprintf(a.stdout, "Removed %s\n", targetKey)
 	return 0
+}
+
+func removeNativeTokenIfMatches(tokenPath string, targetKey domain.AccountKey, targetEmail string) error {
+	raw, err := os.ReadFile(tokenPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read native token %q: %w", tokenPath, err)
+	}
+	id, _, err := oauth.DecodeAgyTokenFile(raw)
+	if err != nil {
+		return nil
+	}
+	wantEmail := strings.TrimSpace(targetEmail)
+	matches := id.Key == targetKey || (wantEmail != "" && strings.EqualFold(strings.TrimSpace(id.Email), wantEmail))
+	if !matches {
+		return nil
+	}
+	if err := os.Remove(tokenPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove staged native token %q: %w", tokenPath, err)
+	}
+	return nil
 }
 
 func (a *App) cmdPlugin(ctx context.Context, args []string) int {
@@ -2052,10 +2079,12 @@ func (a *App) cmdStatusLine(ctx context.Context, args []string) int {
 			Now:      a.now,
 		})
 		line, handleErr := h.HandleStatusLine(ctx, stdinBytes)
-		if handleErr != nil || strings.TrimSpace(line) == "" {
+		if handleErr != nil {
 			line = "[multi-anti: unconfigured]"
 		}
-		fmt.Fprintln(a.stdout, line)
+		if strings.TrimSpace(line) != "" {
+			fmt.Fprintln(a.stdout, line)
+		}
 		return 0
 	default:
 		return a.usageFail(fmt.Sprintf("unknown statusline action %q (expected install, uninstall, or render)", action))
@@ -2759,7 +2788,7 @@ Account Management:
   enable <email-or-key>    Mark an account ready
   disable <email-or-key>   Disable an account from selection
   priority <key> <int>     Set account tie-break priority (higher wins)
-  remove, rm <key>         Delete an account and its isolated profile
+  remove, rm <key>         Delete an account, its isolated profile, and matching staged token
 
 Quota & Execution:
   quota, usage, status     Fetch and rank CloudCode quota across accounts

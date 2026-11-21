@@ -1864,6 +1864,178 @@ func TestAccountsColumnsNativeSyncAndSwitchHints(t *testing.T) {
 	}
 }
 
+func TestStatusLineHidesOutputWhenSignedOut(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+
+	_, populatedStore := setupCLIEnv(t)
+	alice := makeAccount("alice@example.com", 0.80, 0.80, "at-alice", "rt-alice", now.Add(time.Hour))
+	if _, err := populatedStore.Update(ctx, func(s *domain.StoreState) error {
+		s.ActiveKey = alice.Key
+		s.Accounts[alice.Key] = alice
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runStatusLine := func(st store.Store, stdin string) (int, string, string) {
+		var stdout, stderr bytes.Buffer
+		code := Run(ctx, []string{"statusline"}, Config{
+			Store:  st,
+			Stdin:  strings.NewReader(stdin),
+			Stdout: &stdout,
+			Stderr: &stderr,
+			Now:    func() time.Time { return now },
+		})
+		return code, stdout.String(), stderr.String()
+	}
+
+	for _, payload := range []string{`{}`, `{"email":"","agent_state":"idle"}`} {
+		code, out, errOut := runStatusLine(populatedStore, payload)
+		if code != 0 || errOut != "" {
+			t.Fatalf("statusline(%s) code=%d stderr=%q", payload, code, errOut)
+		}
+		if out != "" {
+			t.Fatalf("statusline(%s) stdout = %q, want 0 bytes", payload, out)
+		}
+	}
+
+	_, emptyStore := setupCLIEnv(t)
+	code, out, errOut := runStatusLine(emptyStore, `{}`)
+	if code != 0 || errOut != "" {
+		t.Fatalf("statusline(empty store, {}) code=%d stderr=%q", code, errOut)
+	}
+	if out != "" {
+		t.Fatalf("statusline(empty store, {}) stdout = %q, want 0 bytes", out)
+	}
+
+	code, out, errOut = runStatusLine(populatedStore, `{"email":"alice@example.com"}`)
+	if code != 0 || errOut != "" {
+		t.Fatalf("statusline(signed-in) code=%d stderr=%q", code, errOut)
+	}
+	if !strings.Contains(out, "alice@example.com") {
+		t.Fatalf("expected alice@example.com in signed-in statusline output, got %q", out)
+	}
+}
+
+func TestRemoveClearsMatchingStagedNativeToken(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+
+	t.Run("removes native token only when staged account matches removed account", func(t *testing.T) {
+		paths, st := setupCLIEnv(t)
+		alice := makeAccount("alice@example.com", 0.80, 0.80, "at-alice", "rt-alice", now.Add(time.Hour))
+		bob := makeAccount("bob@example.com", 0.70, 0.70, "at-bob", "rt-bob", now.Add(time.Hour))
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = alice.Key
+			s.Accounts[alice.Key] = alice
+			s.Accounts[bob.Key] = bob
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		aliceRaw, err := oauth.EncodeAgyTokenFile(alice.Email, alice.Creds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := platform.WriteFileAtomic(paths.NativeAgyTokenPath(), aliceRaw, true); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		cfg := Config{
+			Store:  st,
+			Stdout: &stdout,
+			Stderr: &stderr,
+			Now:    func() time.Time { return now },
+		}
+
+		if code := Run(ctx, []string{"remove", "bob@example.com"}, cfg); code != 0 {
+			t.Fatalf("remove bob failed code=%d stderr=%s", code, stderr.String())
+		}
+		rawAfterBob, err := os.ReadFile(paths.NativeAgyTokenPath())
+		if err != nil {
+			t.Fatalf("expected staged alice token preserved after removing bob, read err=%v", err)
+		}
+		idAfterBob, _, err := oauth.DecodeAgyTokenFile(rawAfterBob)
+		if err != nil || idAfterBob.Key != alice.Key {
+			t.Fatalf("unexpected staged token after removing bob: id=%+v err=%v", idAfterBob, err)
+		}
+
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(ctx, []string{"remove", "alice@example.com"}, cfg); code != 0 {
+			t.Fatalf("remove alice failed code=%d stderr=%s", code, stderr.String())
+		}
+		if _, err := os.Stat(paths.NativeAgyTokenPath()); !os.IsNotExist(err) {
+			t.Fatalf("expected staged native token deleted after removing alice, stat err=%v", err)
+		}
+		state, err := st.Load(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(state.Accounts) != 0 || state.ActiveKey != "" {
+			t.Fatalf("expected empty accounts and cleared ActiveKey, got %+v", state)
+		}
+	})
+
+	t.Run("preserves unmanaged native token and succeeds when native token is absent", func(t *testing.T) {
+		paths, st := setupCLIEnv(t)
+		alice := makeAccount("alice@example.com", 0.80, 0.80, "at-alice", "rt-alice", now.Add(time.Hour))
+		bob := makeAccount("bob@example.com", 0.70, 0.70, "at-bob", "rt-bob", now.Add(time.Hour))
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = alice.Key
+			s.Accounts[alice.Key] = alice
+			s.Accounts[bob.Key] = bob
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		otherRaw, err := oauth.EncodeAgyTokenFile("other@example.com", domain.AccountCredentials{
+			AccessToken:  "at-other",
+			RefreshToken: "rt-other",
+			Expiry:       now.Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := platform.WriteFileAtomic(paths.NativeAgyTokenPath(), otherRaw, true); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		cfg := Config{
+			Store:  st,
+			Stdout: &stdout,
+			Stderr: &stderr,
+			Now:    func() time.Time { return now },
+		}
+
+		if code := Run(ctx, []string{"remove", "alice@example.com"}, cfg); code != 0 {
+			t.Fatalf("remove alice with unmanaged native token failed code=%d stderr=%s", code, stderr.String())
+		}
+		rawAfterAlice, err := os.ReadFile(paths.NativeAgyTokenPath())
+		if err != nil {
+			t.Fatalf("expected unmanaged native token preserved, read err=%v", err)
+		}
+		idAfterAlice, _, err := oauth.DecodeAgyTokenFile(rawAfterAlice)
+		if err != nil || idAfterAlice.Key != "other@example.com" {
+			t.Fatalf("unexpected unmanaged native token content: id=%+v err=%v", idAfterAlice, err)
+		}
+
+		if err := os.Remove(paths.NativeAgyTokenPath()); err != nil {
+			t.Fatal(err)
+		}
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(ctx, []string{"remove", "bob@example.com"}, cfg); code != 0 {
+			t.Fatalf("remove bob when native token absent failed code=%d stderr=%s", code, stderr.String())
+		}
+	})
+}
+
 func hasDoctorCheck(checks []DoctorCheckView, name string, status DoctorStatus) bool {
 	for _, c := range checks {
 		if c.Name == name && c.Status == status {

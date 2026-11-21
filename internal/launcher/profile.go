@@ -336,6 +336,35 @@ func SyncBackStagedToken(ctx context.Context, st store.Store, stagedPath string,
 	return err
 }
 
+func syncSessionAuthAfterRun(ctx context.Context, st store.Store, prepared PreparedLaunch, now time.Time) {
+	if st == nil || strings.TrimSpace(prepared.StagedTokenPath) == "" {
+		return
+	}
+	raw, err := os.ReadFile(prepared.StagedTokenPath)
+	if err != nil {
+		if os.IsNotExist(err) && !prepared.Isolated {
+			_, _ = quota.ClearActiveKeyIfLoggedOut(ctx, st, prepared.StagedTokenPath, "")
+		}
+		return
+	}
+	decodedID, _, err := oauth.DecodeAgyTokenFile(raw)
+	if err != nil {
+		return
+	}
+	wantEmail := strings.TrimSpace(prepared.Account.Email)
+	sameAccount := decodedID.Key == prepared.Account.Key ||
+		(wantEmail != "" && strings.EqualFold(strings.TrimSpace(decodedID.Email), wantEmail))
+	if sameAccount {
+		_ = SyncBackStagedToken(ctx, st, prepared.StagedTokenPath, prepared.Account.Email)
+		return
+	}
+	_, _, _ = quota.UpsertTokenFromFile(ctx, st, prepared.StagedTokenPath, quota.TokenSyncOptions{
+		SetActive:  !prepared.Isolated,
+		RecordUsed: true,
+		Now:        now,
+	})
+}
+
 func resolveExplicitAccount(state domain.StoreState, rawKey domain.AccountKey) (domain.AccountKey, error) {
 	trimmed := strings.TrimSpace(string(rawKey))
 	if trimmed == "" {

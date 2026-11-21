@@ -169,7 +169,7 @@ func Run(
 		}
 
 		runErr := cmd.Run()
-		_ = SyncBackStagedToken(ctx, st, prepared.StagedTokenPath, prepared.Account.Email)
+		syncSessionAuthAfterRun(ctx, st, prepared, nowFn().UTC())
 
 		if ctx.Err() != nil {
 			result.ExitCode = 1

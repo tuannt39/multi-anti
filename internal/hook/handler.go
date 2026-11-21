@@ -141,7 +141,15 @@ func (h *Handler) HandleSessionStart(ctx context.Context, stdin []byte) ([]byte,
 	}
 	now := h.currentTime()
 	syncCtx, syncCancel := context.WithTimeout(ctx, statusLineStoreBudget)
-	_, _ = quota.SyncNativeTokenIfFresher(syncCtx, h.store, now)
+	if isFileAuthSyncActive() {
+		_, _, _ = quota.UpsertTokenFromFile(syncCtx, h.store, h.store.Paths().NativeAgyTokenPath(), quota.TokenSyncOptions{
+			SetActive:  true,
+			RecordUsed: true,
+			Now:        now,
+		})
+	} else {
+		_, _ = quota.SyncNativeTokenIfFresher(syncCtx, h.store, now)
+	}
 	syncCancel()
 
 	state, err := h.store.Load(ctx)
@@ -336,10 +344,17 @@ func (h *Handler) HandleStop(ctx context.Context, stdin []byte) ([]byte, error) 
 
 // HandleStatusLine opportunistically updates cached quota fractions and returns a compact multi-line status table.
 func (h *Handler) HandleStatusLine(ctx context.Context, stdin []byte) (string, error) {
-	var input StatusLineInput
-	_ = parseJSONTolerant(stdin, &input)
-
+	input, isJSONObj := parseStatusLineInput(stdin)
 	now := h.currentTime()
+	if isJSONObj && strings.TrimSpace(input.Email) == "" && !hasStatusLineQuotaReading(input.Quota) {
+		if h.store != nil && isFileAuthSyncActive() {
+			clearCtx, cancel := context.WithTimeout(ctx, statusLineStoreBudget)
+			_, _ = quota.ClearActiveKeyIfLoggedOut(clearCtx, h.store, h.store.Paths().NativeAgyTokenPath(), "")
+			cancel()
+		}
+		return "", nil
+	}
+
 	if h.store == nil {
 		return sanitizeMultiLine(renderStatusWithoutStore(input, now)), nil
 	}
@@ -347,12 +362,20 @@ func (h *Handler) HandleStatusLine(ctx context.Context, stdin []byte) (string, e
 	storeCtx, cancel := context.WithTimeout(ctx, statusLineStoreBudget)
 	defer cancel()
 
+	paths := h.store.Paths()
+	if os.Getenv("MULTI_ANTI_ISOLATED") != "1" && strings.TrimSpace(input.Email) != "" {
+		_, _, _ = quota.UpsertTokenFromFile(storeCtx, h.store, paths.NativeAgyTokenPath(), quota.TokenSyncOptions{
+			ExpectedEmail: input.Email,
+			SetActive:     true,
+			Now:           now,
+		})
+	}
+
 	state, err := h.store.Load(storeCtx)
 	if err != nil {
 		return sanitizeMultiLine(renderStatusWithoutStore(input, now)), nil
 	}
 
-	paths := h.store.Paths()
 	activeKey := resolveStatusLineAccountKey(paths, state, input.Email)
 	if activeKey != "" && len(input.Quota) > 0 {
 		if updatedState, updated := h.mergeStatusLineQuota(storeCtx, state, activeKey, input, now); updated {
@@ -361,6 +384,13 @@ func (h *Handler) HandleStatusLine(ctx context.Context, stdin []byte) (string, e
 	}
 
 	return sanitizeMultiLine(h.renderStatusLine(state, activeKey, input, now)), nil
+}
+
+func isFileAuthSyncActive() bool {
+	if os.Getenv("MULTI_ANTI_ISOLATED") == "1" {
+		return false
+	}
+	return strings.TrimSpace(os.Getenv("SSH_TTY")) != "" || os.Getenv("MULTI_ANTI_MANAGED") == "1"
 }
 
 func (h *Handler) detectAlreadySwitched(
@@ -1360,6 +1390,27 @@ func parseJSONTolerant(data []byte, dst any) error {
 		return nil
 	}
 	return json.Unmarshal(trimmed, dst)
+}
+
+func parseStatusLineInput(stdin []byte) (StatusLineInput, bool) {
+	trimmed := bytes.TrimSpace(stdin)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return StatusLineInput{}, false
+	}
+	var input StatusLineInput
+	if err := json.Unmarshal(trimmed, &input); err != nil {
+		return StatusLineInput{}, false
+	}
+	return input, true
+}
+
+func hasStatusLineQuotaReading(quotaMap map[string]StatusLineQuotaBucket) bool {
+	for _, b := range quotaMap {
+		if b.RemainingFraction != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func marshalJSONLine(v any) ([]byte, error) {

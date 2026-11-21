@@ -623,6 +623,20 @@ func main() {
 	case "non_quota_error":
 		fmt.Fprintln(os.Stderr, "invalid CLI flag")
 		os.Exit(2)
+	case "login_new_account":
+		tokPath := filepath.Join(os.Getenv("MULTI_ANTI_AGY_HOME"), ".gemini", "antigravity-cli", "antigravity-oauth-token")
+		if err := os.MkdirAll(filepath.Dir(tokPath), 0o700); err != nil {
+			os.Exit(9)
+		}
+		payload := "{\"token\":{\"access_token\":\"tok-carol\",\"token_type\":\"Bearer\",\"refresh_token\":\"ref-carol\",\"expiry\":\"2099-01-01T00:00:00Z\"},\"auth_method\":\"consumer\",\"id_token_email\":\"carol@example.com\"}\n"
+		if err := os.WriteFile(tokPath, []byte(payload), 0o600); err != nil {
+			os.Exit(9)
+		}
+	case "logout_delete_token":
+		tokPath := filepath.Join(os.Getenv("MULTI_ANTI_AGY_HOME"), ".gemini", "antigravity-cli", "antigravity-oauth-token")
+		if err := os.Remove(tokPath); err != nil {
+			os.Exit(9)
+		}
 	default:
 		os.Exit(3)
 	}
@@ -874,6 +888,88 @@ func main() {
 		}
 		if _, ok, _ := hook.ReadLatestSwitchSignal(paths); ok {
 			t.Fatalf("expected switch signal cleared after relaunch")
+		}
+	})
+
+	t.Run("auto-enrolls new account written by /login during agy session", func(t *testing.T) {
+		_, _, st := setupLauncherEnv(t)
+		alice := makeLauncherAccount("alice@example.com", 0.90, "tok-alice", "ref-alice", now.Add(time.Hour))
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.Accounts[alice.Key] = alice
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		res, err := Run(ctx, st, nil, nil, nil, RunOptions{
+			Binary:    fakeBin,
+			NoRefresh: true,
+			Stdin:     strings.NewReader(""),
+			Stdout:    &stdout,
+			Stderr:    &stderr,
+			ExtraEnv:  []string{"FAKE_AGY_MODE=login_new_account"},
+			Now:       func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if res.ExitCode != 0 {
+			t.Fatalf("ExitCode = %d, want 0", res.ExitCode)
+		}
+
+		after, err := st.Load(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.ActiveKey != "carol@example.com" {
+			t.Fatalf("ActiveKey = %q, want carol@example.com", after.ActiveKey)
+		}
+		carol, ok := after.Accounts["carol@example.com"]
+		if !ok || carol.Health.Status != domain.HealthReady || carol.Creds.AccessToken != "tok-carol" || carol.Creds.RefreshToken != "ref-carol" {
+			t.Fatalf("carol not auto-enrolled after /login: ok=%v acc=%+v", ok, carol)
+		}
+		if orig, ok := after.Accounts[alice.Key]; !ok || orig.Creds.AccessToken != "tok-alice" {
+			t.Fatalf("alice unexpectedly modified: ok=%v acc=%+v", ok, orig)
+		}
+	})
+
+	t.Run("clears active_key when /logout deletes staged token during agy session", func(t *testing.T) {
+		_, _, st := setupLauncherEnv(t)
+		alice := makeLauncherAccount("alice@example.com", 0.90, "tok-alice", "ref-alice", now.Add(time.Hour))
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.Accounts[alice.Key] = alice
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		res, err := Run(ctx, st, nil, nil, nil, RunOptions{
+			Binary:    fakeBin,
+			NoRefresh: true,
+			Stdin:     strings.NewReader(""),
+			Stdout:    &stdout,
+			Stderr:    &stderr,
+			ExtraEnv:  []string{"FAKE_AGY_MODE=logout_delete_token"},
+			Now:       func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if res.ExitCode != 0 {
+			t.Fatalf("ExitCode = %d, want 0", res.ExitCode)
+		}
+
+		after, err := st.Load(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.ActiveKey != "" {
+			t.Fatalf("ActiveKey = %q, want empty after /logout", after.ActiveKey)
+		}
+		if _, ok := after.Accounts[alice.Key]; !ok {
+			t.Fatalf("alice removed unexpectedly during soft-sync /logout")
 		}
 	})
 }

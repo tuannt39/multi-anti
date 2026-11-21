@@ -784,6 +784,166 @@ func RefreshAccountToken(
 
 var errNativeTokenNotFresher = errors.New("native token not fresher")
 
+// TokenSyncOptions controls how a token file written by agy is synchronized into the store.
+type TokenSyncOptions struct {
+	ExpectedEmail string
+	SetActive     bool
+	RecordUsed    bool
+	Now           time.Time
+}
+
+// UpsertTokenFromFile enrolls a new account or updates fresher credentials from tokenPath into st.
+func UpsertTokenFromFile(ctx context.Context, st store.Store, tokenPath string, opts TokenSyncOptions) (domain.AccountKey, bool, error) {
+	if st == nil || strings.TrimSpace(tokenPath) == "" {
+		return "", false, nil
+	}
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+
+	raw, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return "", false, nil
+	}
+	decodedID, decodedCreds, err := oauth.DecodeAgyTokenFile(raw)
+	if err != nil {
+		return "", false, nil
+	}
+	if !tokenIdentityMatchesExpectedEmail(decodedID, opts.ExpectedEmail) {
+		return "", false, nil
+	}
+
+	state, err := st.Load(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if targetKey, cur, exists := findManagedAccountByIdentity(state, decodedID); exists {
+		if !accountNeedsTokenSync(cur, decodedID, decodedCreds, state.ActiveKey, opts, now) {
+			return targetKey, false, nil
+		}
+	}
+
+	var resultKey domain.AccountKey
+	changed := false
+	_, updErr := st.Update(ctx, func(s *domain.StoreState) error {
+		k, acc, exists := findManagedAccountByIdentity(*s, decodedID)
+		if !exists {
+			resultKey = decodedID.Key
+			newAcc := domain.Account{
+				Key:         decodedID.Key,
+				Email:       strings.TrimSpace(decodedID.Email),
+				AccountID:   strings.TrimSpace(decodedID.AccountID),
+				DisplayName: strings.TrimSpace(decodedID.DisplayName),
+				Health: domain.AccountHealth{
+					Status:    domain.HealthReady,
+					UpdatedAt: now,
+				},
+				Creds:   decodedCreds,
+				AddedAt: now,
+			}
+			if opts.RecordUsed {
+				usedAt := now
+				newAcc.LastUsedAt = &usedAt
+			}
+			if s.Accounts == nil {
+				s.Accounts = make(map[domain.AccountKey]domain.Account)
+			}
+			s.Accounts[decodedID.Key] = newAcc
+			if opts.SetActive || s.ActiveKey == "" {
+				s.ActiveKey = decodedID.Key
+			}
+			changed = true
+			return nil
+		}
+
+		resultKey = k
+		if !accountNeedsTokenSync(acc, decodedID, decodedCreds, s.ActiveKey, opts, now) {
+			return errNativeTokenNotFresher
+		}
+		if isNativeCredsFresher(acc.Creds, decodedCreds) {
+			mergeNativeCreds(&acc, decodedCreds, now)
+		} else if acc.Health.Status == domain.HealthNeedsReauth && !oauth.NeedsRefresh(decodedCreds, 0, now) {
+			acc.Health = domain.AccountHealth{
+				Status:    domain.HealthReady,
+				UpdatedAt: now,
+			}
+			if acc.Quota != nil && acc.Quota.FetchError != "" {
+				qCopy := *acc.Quota
+				qCopy.FetchError = ""
+				acc.Quota = &qCopy
+			}
+		}
+		if acc.Email == "" && strings.TrimSpace(decodedID.Email) != "" {
+			acc.Email = strings.TrimSpace(decodedID.Email)
+		}
+		if acc.AccountID == "" && strings.TrimSpace(decodedID.AccountID) != "" {
+			acc.AccountID = strings.TrimSpace(decodedID.AccountID)
+		}
+		if acc.DisplayName == "" && strings.TrimSpace(decodedID.DisplayName) != "" {
+			acc.DisplayName = strings.TrimSpace(decodedID.DisplayName)
+		}
+		if opts.RecordUsed && (acc.LastUsedAt == nil || !acc.LastUsedAt.Equal(now)) {
+			usedAt := now
+			acc.LastUsedAt = &usedAt
+		}
+		s.Accounts[k] = acc
+		if opts.SetActive {
+			s.ActiveKey = k
+		}
+		changed = true
+		return nil
+	})
+	if errors.Is(updErr, errNativeTokenNotFresher) {
+		return resultKey, false, nil
+	}
+	if updErr != nil {
+		return "", false, updErr
+	}
+	return resultKey, changed, nil
+}
+
+// ClearActiveKeyIfLoggedOut clears ActiveKey while preserving all stored accounts
+// when the native token file has been deleted (for example by agy /logout).
+func ClearActiveKeyIfLoggedOut(ctx context.Context, st store.Store, tokenPath string, onlyIfActiveKey domain.AccountKey) (bool, error) {
+	if st == nil || strings.TrimSpace(tokenPath) == "" {
+		return false, nil
+	}
+	if _, err := os.Stat(tokenPath); !os.IsNotExist(err) {
+		return false, nil
+	}
+
+	state, err := st.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	if state.ActiveKey == "" || (onlyIfActiveKey != "" && state.ActiveKey != onlyIfActiveKey) {
+		return false, nil
+	}
+
+	cleared := false
+	_, updErr := st.Update(ctx, func(s *domain.StoreState) error {
+		if _, statErr := os.Stat(tokenPath); !os.IsNotExist(statErr) {
+			return errNativeTokenNotFresher
+		}
+		if s.ActiveKey == "" || (onlyIfActiveKey != "" && s.ActiveKey != onlyIfActiveKey) {
+			return errNativeTokenNotFresher
+		}
+		s.ActiveKey = ""
+		cleared = true
+		return nil
+	})
+	if errors.Is(updErr, errNativeTokenNotFresher) {
+		return false, nil
+	}
+	if updErr != nil {
+		return false, updErr
+	}
+	return cleared, nil
+}
+
 // SyncNativeTokenIfFresher imports fresher credentials written by agy into NativeAgyTokenPath()
 // for an already managed account before multi-anti overwrites the staged token or renders state.
 func SyncNativeTokenIfFresher(ctx context.Context, st store.Store, now time.Time) (bool, error) {
@@ -825,28 +985,7 @@ func SyncNativeTokenIfFresher(ctx context.Context, st store.Store, now time.Time
 			return errNativeTokenNotFresher
 		}
 
-		merged := decodedCreds
-		if strings.TrimSpace(merged.ClientID) == "" {
-			merged.ClientID = acc.Creds.ClientID
-		}
-		if strings.TrimSpace(merged.RefreshToken) == "" {
-			merged.RefreshToken = acc.Creds.RefreshToken
-		}
-		if strings.TrimSpace(merged.IDToken) == "" {
-			merged.IDToken = acc.Creds.IDToken
-		}
-		acc.Creds = merged
-		if acc.Health.Status == domain.HealthNeedsReauth {
-			acc.Health = domain.AccountHealth{
-				Status:    domain.HealthReady,
-				UpdatedAt: now,
-			}
-		}
-		if acc.Quota != nil && acc.Quota.FetchError != "" && !oauth.NeedsRefresh(merged, 0, now) {
-			qCopy := *acc.Quota
-			qCopy.FetchError = ""
-			acc.Quota = &qCopy
-		}
+		mergeNativeCreds(&acc, decodedCreds, now)
 		s.Accounts[targetKey] = acc
 		changed = true
 		return nil
@@ -858,6 +997,71 @@ func SyncNativeTokenIfFresher(ctx context.Context, st store.Store, now time.Time
 		return false, updErr
 	}
 	return changed, nil
+}
+
+func tokenIdentityMatchesExpectedEmail(id domain.AccountIdentity, expectedEmail string) bool {
+	wantEmail := strings.TrimSpace(expectedEmail)
+	if wantEmail == "" {
+		return true
+	}
+	if e := strings.TrimSpace(id.Email); e != "" && strings.EqualFold(e, wantEmail) {
+		return true
+	}
+	wantKey, err := domain.NormalizeAccountKey(wantEmail, "")
+	return err == nil && id.Key == wantKey
+}
+
+func accountNeedsTokenSync(
+	acc domain.Account,
+	decodedID domain.AccountIdentity,
+	decodedCreds domain.AccountCredentials,
+	activeKey domain.AccountKey,
+	opts TokenSyncOptions,
+	now time.Time,
+) bool {
+	if isNativeCredsFresher(acc.Creds, decodedCreds) {
+		return true
+	}
+	if acc.Health.Status == domain.HealthNeedsReauth && !oauth.NeedsRefresh(decodedCreds, 0, now) {
+		return true
+	}
+	if (acc.Email == "" && strings.TrimSpace(decodedID.Email) != "") ||
+		(acc.AccountID == "" && strings.TrimSpace(decodedID.AccountID) != "") ||
+		(acc.DisplayName == "" && strings.TrimSpace(decodedID.DisplayName) != "") {
+		return true
+	}
+	if opts.SetActive && activeKey != acc.Key {
+		return true
+	}
+	if opts.RecordUsed && (acc.LastUsedAt == nil || !acc.LastUsedAt.Equal(now)) {
+		return true
+	}
+	return false
+}
+
+func mergeNativeCreds(acc *domain.Account, decodedCreds domain.AccountCredentials, now time.Time) {
+	merged := decodedCreds
+	if strings.TrimSpace(merged.ClientID) == "" {
+		merged.ClientID = acc.Creds.ClientID
+	}
+	if strings.TrimSpace(merged.RefreshToken) == "" {
+		merged.RefreshToken = acc.Creds.RefreshToken
+	}
+	if strings.TrimSpace(merged.IDToken) == "" {
+		merged.IDToken = acc.Creds.IDToken
+	}
+	acc.Creds = merged
+	if acc.Health.Status == domain.HealthNeedsReauth {
+		acc.Health = domain.AccountHealth{
+			Status:    domain.HealthReady,
+			UpdatedAt: now,
+		}
+	}
+	if acc.Quota != nil && acc.Quota.FetchError != "" && !oauth.NeedsRefresh(merged, 0, now) {
+		qCopy := *acc.Quota
+		qCopy.FetchError = ""
+		acc.Quota = &qCopy
+	}
 }
 
 func findManagedAccountByIdentity(state domain.StoreState, id domain.AccountIdentity) (domain.AccountKey, domain.Account, bool) {

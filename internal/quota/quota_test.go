@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -1102,4 +1103,298 @@ func TestRefreshAndFetchAllUsesValidTokenWithinSkewWhenClientIDMissing(t *testin
 	if got := results[0].Snapshot.Buckets[0].RemainingFraction; got != 0.55 {
 		t.Fatalf("remaining = %v, want 0.55", got)
 	}
+}
+
+func TestUpsertTokenFromFileAndClearActiveKeyIfLoggedOut(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 21, 14, 0, 0, 0, time.UTC)
+
+	t.Run("enrolls new account from token file and sets active key", func(t *testing.T) {
+		st := newQuotaTestStore(t)
+		tokPath := st.Paths().NativeAgyTokenPath()
+		raw, err := oauth.EncodeAgyTokenFile("carol@example.com", domain.AccountCredentials{
+			AccessToken:  "tok-carol",
+			RefreshToken: "ref-carol",
+			Expiry:       now.Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := platform.WriteFileAtomic(tokPath, raw, true); err != nil {
+			t.Fatal(err)
+		}
+
+		key, changed, err := UpsertTokenFromFile(ctx, st, tokPath, TokenSyncOptions{
+			ExpectedEmail: "carol@example.com",
+			SetActive:     true,
+			RecordUsed:    true,
+			Now:           now,
+		})
+		if err != nil {
+			t.Fatalf("UpsertTokenFromFile(new) error = %v", err)
+		}
+		if !changed || key != "carol@example.com" {
+			t.Fatalf("got key=%q changed=%v, want carol@example.com true", key, changed)
+		}
+
+		after, err := st.Load(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.ActiveKey != "carol@example.com" {
+			t.Fatalf("ActiveKey = %q, want carol@example.com", after.ActiveKey)
+		}
+		carol, ok := after.Accounts["carol@example.com"]
+		if !ok {
+			t.Fatalf("carol not enrolled in store: %+v", after.Accounts)
+		}
+		if carol.Health.Status != domain.HealthReady || carol.Creds.AccessToken != "tok-carol" || carol.Creds.RefreshToken != "ref-carol" {
+			t.Fatalf("unexpected enrolled account: %+v", carol)
+		}
+		if carol.LastUsedAt == nil || !carol.LastUsedAt.Equal(now) {
+			t.Fatalf("LastUsedAt = %v, want %v", carol.LastUsedAt, now)
+		}
+
+		genBefore := after.Generation
+		key2, changed2, err := UpsertTokenFromFile(ctx, st, tokPath, TokenSyncOptions{
+			ExpectedEmail: "carol@example.com",
+			SetActive:     true,
+			RecordUsed:    true,
+			Now:           now,
+		})
+		if err != nil {
+			t.Fatalf("UpsertTokenFromFile(idempotent) error = %v", err)
+		}
+		if changed2 || key2 != "carol@example.com" {
+			t.Fatalf("idempotent call got key=%q changed=%v, want carol@example.com false", key2, changed2)
+		}
+		after2, _ := st.Load(ctx)
+		if after2.Generation != genBefore {
+			t.Fatalf("Generation changed on idempotent sync: %d -> %d", genBefore, after2.Generation)
+		}
+	})
+
+	t.Run("updates fresher existing account without clearing cooldown or disabled health", func(t *testing.T) {
+		st := newQuotaTestStore(t)
+		tokPath := st.Paths().NativeAgyTokenPath()
+		cooldownUntil := now.Add(15 * time.Minute)
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = "bob@example.com"
+			s.Accounts["alice@example.com"] = domain.Account{
+				Key:   "alice@example.com",
+				Email: "alice@example.com",
+				Health: domain.AccountHealth{
+					Status:        domain.HealthCooldown,
+					Reason:        "rate limited",
+					CooldownUntil: &cooldownUntil,
+					UpdatedAt:     now.Add(-5 * time.Minute),
+				},
+				Creds: domain.AccountCredentials{
+					AccessToken:  "old-alice",
+					RefreshToken: "keep-rt-alice",
+					IDToken:      "keep-id-alice",
+					ClientID:     "keep-cid-alice",
+					Expiry:       now.Add(5 * time.Minute),
+				},
+				AddedAt: now.Add(-24 * time.Hour),
+			}
+			s.Accounts["bob@example.com"] = domain.Account{
+				Key:   "bob@example.com",
+				Email: "bob@example.com",
+				Health: domain.AccountHealth{
+					Status:    domain.HealthDisabled,
+					Reason:    "manual disable",
+					UpdatedAt: now.Add(-5 * time.Minute),
+				},
+				Creds: domain.AccountCredentials{
+					AccessToken:  "old-bob",
+					RefreshToken: "keep-rt-bob",
+					Expiry:       now.Add(5 * time.Minute),
+				},
+				AddedAt: now.Add(-24 * time.Hour),
+			}
+			s.Accounts["dave@example.com"] = domain.Account{
+				Key:   "dave@example.com",
+				Email: "dave@example.com",
+				Health: domain.AccountHealth{
+					Status:    domain.HealthNeedsReauth,
+					Reason:    "unauthorized",
+					UpdatedAt: now.Add(-5 * time.Minute),
+				},
+				Creds: domain.AccountCredentials{
+					AccessToken:  "old-dave",
+					RefreshToken: "keep-rt-dave",
+					Expiry:       now.Add(-time.Minute),
+				},
+				Quota: &domain.QuotaSnapshot{
+					FetchedAt:  now.Add(-time.Minute),
+					Tier:       domain.TierPro,
+					FetchError: "unauthorized",
+				},
+				AddedAt: now.Add(-24 * time.Hour),
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		aliceRaw, _ := oauth.EncodeAgyTokenFile("alice@example.com", domain.AccountCredentials{
+			AccessToken: "fresh-alice",
+			Expiry:      now.Add(50 * time.Minute),
+		})
+		if err := platform.WriteFileAtomic(tokPath, aliceRaw, true); err != nil {
+			t.Fatal(err)
+		}
+		if _, changed, err := UpsertTokenFromFile(ctx, st, tokPath, TokenSyncOptions{SetActive: true, Now: now}); err != nil || !changed {
+			t.Fatalf("alice upsert got changed=%v err=%v", changed, err)
+		}
+
+		bobRaw, _ := oauth.EncodeAgyTokenFile("bob@example.com", domain.AccountCredentials{
+			AccessToken: "fresh-bob",
+			Expiry:      now.Add(50 * time.Minute),
+		})
+		if err := platform.WriteFileAtomic(tokPath, bobRaw, true); err != nil {
+			t.Fatal(err)
+		}
+		if _, changed, err := UpsertTokenFromFile(ctx, st, tokPath, TokenSyncOptions{SetActive: false, Now: now}); err != nil || !changed {
+			t.Fatalf("bob upsert got changed=%v err=%v", changed, err)
+		}
+
+		daveRaw, _ := oauth.EncodeAgyTokenFile("dave@example.com", domain.AccountCredentials{
+			AccessToken: "fresh-dave",
+			Expiry:      now.Add(50 * time.Minute),
+		})
+		if err := platform.WriteFileAtomic(tokPath, daveRaw, true); err != nil {
+			t.Fatal(err)
+		}
+		if _, changed, err := UpsertTokenFromFile(ctx, st, tokPath, TokenSyncOptions{SetActive: false, Now: now}); err != nil || !changed {
+			t.Fatalf("dave upsert got changed=%v err=%v", changed, err)
+		}
+
+		after, _ := st.Load(ctx)
+		if after.ActiveKey != "alice@example.com" {
+			t.Fatalf("ActiveKey = %q, want alice@example.com", after.ActiveKey)
+		}
+		alice := after.Accounts["alice@example.com"]
+		if alice.Health.Status != domain.HealthCooldown {
+			t.Fatalf("alice cooldown unexpectedly cleared: %+v", alice.Health)
+		}
+		if alice.Creds.AccessToken != "fresh-alice" || alice.Creds.RefreshToken != "keep-rt-alice" || alice.Creds.IDToken != "keep-id-alice" || alice.Creds.ClientID != "keep-cid-alice" {
+			t.Fatalf("alice creds lost preserved fields: %+v", alice.Creds)
+		}
+		if after.Accounts["bob@example.com"].Health.Status != domain.HealthDisabled {
+			t.Fatalf("bob disabled status unexpectedly cleared: %+v", after.Accounts["bob@example.com"].Health)
+		}
+		dave := after.Accounts["dave@example.com"]
+		if dave.Health.Status != domain.HealthReady || dave.Quota.FetchError != "" {
+			t.Fatalf("dave reauth/error not cleared: health=%+v quota=%+v", dave.Health, dave.Quota)
+		}
+	})
+
+	t.Run("skips token file when expected email mismatches", func(t *testing.T) {
+		st := newQuotaTestStore(t)
+		tokPath := st.Paths().NativeAgyTokenPath()
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = "alice@example.com"
+			s.Accounts["alice@example.com"] = domain.Account{
+				Key:     "alice@example.com",
+				Email:   "alice@example.com",
+				Health:  domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now},
+				AddedAt: now.Add(-time.Hour),
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		strangerRaw, _ := oauth.EncodeAgyTokenFile("stranger@example.com", domain.AccountCredentials{
+			AccessToken:  "stranger-at",
+			RefreshToken: "stranger-rt",
+			Expiry:       now.Add(time.Hour),
+		})
+		if err := platform.WriteFileAtomic(tokPath, strangerRaw, true); err != nil {
+			t.Fatal(err)
+		}
+
+		key, changed, err := UpsertTokenFromFile(ctx, st, tokPath, TokenSyncOptions{
+			ExpectedEmail: "alice@example.com",
+			SetActive:     true,
+			Now:           now,
+		})
+		if err != nil {
+			t.Fatalf("UpsertTokenFromFile(mismatch) error = %v", err)
+		}
+		if changed || key != "" {
+			t.Fatalf("got key=%q changed=%v, want empty false", key, changed)
+		}
+		after, _ := st.Load(ctx)
+		if len(after.Accounts) != 1 || after.ActiveKey != "alice@example.com" {
+			t.Fatalf("mismatched expected email mutated store: %+v", after)
+		}
+	})
+
+	t.Run("clears active key only when token file is absent", func(t *testing.T) {
+		st := newQuotaTestStore(t)
+		tokPath := st.Paths().NativeAgyTokenPath()
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = "alice@example.com"
+			s.Accounts["alice@example.com"] = domain.Account{
+				Key:     "alice@example.com",
+				Email:   "alice@example.com",
+				Health:  domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now},
+				AddedAt: now.Add(-time.Hour),
+			}
+			s.Accounts["bob@example.com"] = domain.Account{
+				Key:     "bob@example.com",
+				Email:   "bob@example.com",
+				Health:  domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now},
+				AddedAt: now.Add(-time.Hour),
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		raw, _ := oauth.EncodeAgyTokenFile("alice@example.com", domain.AccountCredentials{
+			AccessToken:  "at-alice",
+			RefreshToken: "rt-alice",
+			Expiry:       now.Add(time.Hour),
+		})
+		if err := platform.WriteFileAtomic(tokPath, raw, true); err != nil {
+			t.Fatal(err)
+		}
+
+		changed, err := ClearActiveKeyIfLoggedOut(ctx, st, tokPath, "")
+		if err != nil || changed {
+			t.Fatalf("expected no clear while token file exists, got changed=%v err=%v", changed, err)
+		}
+
+		if err := os.Remove(tokPath); err != nil {
+			t.Fatal(err)
+		}
+
+		changed, err = ClearActiveKeyIfLoggedOut(ctx, st, tokPath, "bob@example.com")
+		if err != nil || changed {
+			t.Fatalf("expected no clear when onlyIfActiveKey mismatches, got changed=%v err=%v", changed, err)
+		}
+
+		changed, err = ClearActiveKeyIfLoggedOut(ctx, st, tokPath, "")
+		if err != nil || !changed {
+			t.Fatalf("expected active key cleared when token file absent, got changed=%v err=%v", changed, err)
+		}
+		after, _ := st.Load(ctx)
+		if after.ActiveKey != "" || len(after.Accounts) != 2 {
+			t.Fatalf("unexpected state after ClearActiveKeyIfLoggedOut: active=%q len=%d", after.ActiveKey, len(after.Accounts))
+		}
+
+		genBefore := after.Generation
+		changed2, err := ClearActiveKeyIfLoggedOut(ctx, st, tokPath, "")
+		if err != nil || changed2 {
+			t.Fatalf("second clear got changed=%v err=%v, want false nil", changed2, err)
+		}
+		after2, _ := st.Load(ctx)
+		if after2.Generation != genBefore {
+			t.Fatalf("Generation bumped on empty ActiveKey clear: %d -> %d", genBefore, after2.Generation)
+		}
+	})
 }

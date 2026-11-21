@@ -208,7 +208,7 @@ multi-anti import --native
 multi-anti import /path/to/export.json
 ```
 
-Native `agy` writes `~/.gemini/antigravity-cli/antigravity-oauth-token` only when `agy` runs with `SSH_TTY` set, such as `SSH_TTY=1 agy`. Desktop `agy` without `SSH_TTY` stores credentials in OS Keyring on Linux and macOS, or Windows Credential Manager on Windows, so `antigravity-oauth-token` does not exist on disk. When that file is absent, sign in with `multi-anti login`, or run `SSH_TTY=1 agy` once before you run `multi-anti import --native`.
+Native `agy` writes `~/.gemini/antigravity-cli/antigravity-oauth-token` only when `agy` runs with `SSH_TTY` set, such as `SSH_TTY=1 agy`. Desktop `agy` without `SSH_TTY` writes credentials to OS Keyring on Linux and macOS, or Windows Credential Manager on Windows, so `antigravity-oauth-token` does not exist on disk initially; however, `agy` 1.5.14+ still reads a leftover `antigravity-oauth-token` file as a fallback when OS Keyring is empty. When that file is absent, sign in with `multi-anti login`, or run `SSH_TTY=1 agy` once before you run `multi-anti import --native`.
 
 ### Verify accounts, quota, and health
 
@@ -256,10 +256,13 @@ function agy { multi-anti run --auto-relaunch -- @args }
 
 When that alias is active, run `command agy` in Bash or Zsh, or `agy.exe` in PowerShell, if you need to call native `agy` directly.
 
-To run native `agy` directly after `multi-anti switch` or `multi-anti next`, set `SSH_TTY=multi-anti` in your shell profile. `agy` then reads `~/.gemini/antigravity-cli/antigravity-oauth-token` instead of OS Keyring or Windows Credential Manager:
+To run native `agy` directly after `multi-anti switch` or `multi-anti next`, or to keep `/login` and `/logout` inside `agy` synced with `multi-anti`, scope `SSH_TTY=multi-anti` via a shell alias (or export `SSH_TTY=multi-anti` in your shell profile). `agy` then reads and writes `~/.gemini/antigravity-cli/antigravity-oauth-token` instead of OS Keyring or Windows Credential Manager:
 
 ```bash
-# Bash or Zsh
+# Bash or Zsh (recommended scoped alias)
+alias agy='SSH_TTY=multi-anti agy'
+
+# Or export globally
 export SSH_TTY=multi-anti
 ```
 
@@ -270,8 +273,8 @@ $env:SSH_TTY = "multi-anti"
 
 ### Using native `agy` directly vs `multi-anti`
 
-- **Direct `agy` without `SSH_TTY`.** Desktop `agy` uses OS Keyring or Windows Credential Manager and runs a local browser loopback OAuth flow, which does not update `~/.gemini/antigravity-cli/antigravity-oauth-token` or enroll accounts into `state.json`. If browser loopback sign-in fails with `consumerOAuth: token exchange failed`, sign in with `multi-anti login` instead; it runs `agy` inside a clean isolated profile with `SSH_TTY=multi-anti` using `https://antigravity.google/oauth-callback` code paste.
-- **Direct `agy` with `SSH_TTY=multi-anti`.** Once the `multi-anti` plugin is installed, `SessionStart`, `Stop`, and `statusline` hooks still run for direct `agy` sessions, syncing fresher tokens back for already managed accounts and recording `last_used_at`. If you sign into a new account directly via `SSH_TTY=multi-anti agy`, run `multi-anti import --native` afterward to register it with `multi-anti`.
+- **Direct `agy` without `SSH_TTY`.** Desktop `agy` writes credentials to OS Keyring or Windows Credential Manager and runs a local browser loopback OAuth flow, which does not enroll accounts into `state.json`. Note that `agy` 1.5.14+ still falls back to reading `~/.gemini/antigravity-cli/antigravity-oauth-token` when OS Keyring is empty, so direct `agy` will pick up a previously staged native token unless you remove that account or run `multi-anti restore`. If browser loopback sign-in fails with `consumerOAuth: token exchange failed`, sign in with `multi-anti login` instead; it runs `agy` inside a clean isolated profile with `SSH_TTY=multi-anti` using `https://antigravity.google/oauth-callback` code paste.
+- **Direct `agy` with `SSH_TTY=multi-anti` or `multi-anti run`.** Once the `multi-anti` plugin is installed, `SessionStart`, `Stop`, and `statusline` hooks (along with `multi-anti run` on exit) automatically synchronize `/login` and `/logout` with `state.json`. Running `/login` inside `agy` enrolls a new account or updates fresher credentials for an existing account and sets `active_key`; running `/logout` deletes the native token file, hides the status line, and clears `active_key` while keeping saved accounts in `state.json`.
 - **`next` or `switch` vs `run`.** The default policy mode (`highest_remaining`) causes plain `multi-anti run` to re-pick whichever ready account currently has the most remaining quota. After `multi-anti next` or `multi-anti switch <account>`, pass `multi-anti run --account <key>`, launch `SSH_TTY=multi-anti agy` directly, or run `multi-anti policy --mode fill_first` so `multi-anti run` keeps the active account selected until exhausted.
 
 ## CLI reference
@@ -285,7 +288,7 @@ $env:SSH_TTY = "multi-anti"
 - `multi-anti next [--model <m>] [--pool <gemini|3p|gemini-argon|all>] [--no-refresh] [--json]` switches away from the active account to the next eligible account ranked by policy, staging accounts with a `refresh_token` even when `client_id` is unset.
 - `multi-anti enable <email-or-key>` and `multi-anti disable <email-or-key>` mark an account `ready` or `disabled`.
 - `multi-anti priority <email-or-key> <int>` sets an integer priority where higher values win tie-breaks and `priority` selection mode.
-- `multi-anti remove <email-or-key>` (also `rm`) deletes an account from `state.json`, clears `active_key` if matched, and removes its isolated profile directory.
+- `multi-anti remove <email-or-key>` (also `rm`) deletes an account from `state.json`, clears `active_key` if matched, removes its isolated profile directory, and deletes `~/.gemini/antigravity-cli/antigravity-oauth-token` when that staged native token belongs to the removed account.
 
 ### Quota and execution
 
@@ -304,7 +307,7 @@ $env:SSH_TTY = "multi-anti"
 ### Plugin, hooks, diagnostics, and restore
 
 - `multi-anti plugin <install|uninstall|status> [--bin <path>] [--no-statusline] [--json]` installs, removes, or inspects the embedded plugin bundle in `~/.gemini/config/plugins/multi-anti` and configures `statusLine` in `agy` `settings.json`.
-- `multi-anti statusline [install|uninstall|render] [--bin <path>]` configures or renders a compact multi-line `agy` status table showing all managed accounts (`*` active, `>` next, standby, cooldown) with `GEMINI 5h/wk`, `CLAUDE/GPT 5h/wk`, `ARGON wk`, and status (defaults to `render`).
+- `multi-anti statusline [install|uninstall|render] [--bin <path>]` configures or renders a compact multi-line `agy` status table showing all managed accounts (`*` active, `>` next, standby, cooldown) with `GEMINI 5h/wk`, `CLAUDE/GPT 5h/wk`, `ARGON wk`, and status (defaults to `render`). It outputs nothing when `agy` sends a signed-out status payload (no `email` and no quota data).
 - `multi-anti hook <session-start|stop>` handles `agy` plugin hook events for `SessionStart` and `Stop`.
 - `multi-anti doctor [--json]` checks the `agy` binary and version, `state.json`, native backup SHA256 integrity, account health and refresh token presence, plugin files, `agy plugin validate --strict`, `statusLine` configuration, `SSH_TTY`, and an `[INFO]` `oauth_client` line noting whether OAuth client credentials are configured or using `agy` fallback.
 - `multi-anti restore` (also `restore-native`) restores the pre-`multi-anti` native `antigravity-oauth-token` (or removes it if none existed originally) and restores the prior `statusLine` setting.
@@ -317,7 +320,7 @@ $env:SSH_TTY = "multi-anti"
 2. **SessionStart hook.** Displays the active account, remaining quota percentage, and ready count in the UI without injecting prompt bloat into model context.
 3. **Stop hook.** When `agy` stops with a quota exhaustion error (`429`, `RESOURCE_EXHAUSTED`, spend cap, or window limit), `multi-anti hook stop` places the failing account on cooldown until reset, stages the next ready account, and writes a switch signal in `signals/`. It stages standby accounts that have a `refresh_token` even without OAuth `client_id`.
 4. **Automatic retry and relaunch.** In headless mode (`-p`, `--print`, or `--prompt`), `multi-anti run` detects either the `Stop` hook signal or captured `429` or `RESOURCE_EXHAUSTED` output. It places the exhausted account on cooldown and retries with the next ready account up to `--max-switches` (default `3`). When the `Stop` signal provides `conversationId` and `--isolate` is off, the retry preserves conversation context with `--conversation`. In interactive mode, `--auto-relaunch` relaunches `agy` with `--conversation` when the `Stop` hook records a switch.
-5. **Token sync-back.** After `agy` exits, `SyncBackStagedToken` writes any refreshed OAuth token created by `agy` back to `state.json` if the staged token still belongs to the launched account.
+5. **Token sync-back and `/login` / `/logout` sync.** After `agy` exits (and during `SessionStart` or `statusline` hooks under `SSH_TTY=multi-anti`), `multi-anti` writes refreshed OAuth tokens back to `state.json`, automatically enrolls new accounts signed in via `/login` and switches `active_key`, and soft-clears `active_key` while preserving saved accounts if `/logout` removed the staged native token.
 
 ## Isolated profiles with `--isolate`
 

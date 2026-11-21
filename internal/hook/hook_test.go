@@ -43,6 +43,8 @@ func setupIsolatedHookEnv(t *testing.T) (platform.Paths, *store.FileStore) {
 	t.Setenv("MULTI_ANTI_AGY_HOME", filepath.Join(tmp, "agy-home"))
 	t.Setenv("MULTI_ANTI_ACCOUNT", "")
 	t.Setenv("MULTI_ANTI_ISOLATED", "")
+	t.Setenv("MULTI_ANTI_MANAGED", "")
+	t.Setenv("SSH_TTY", "")
 
 	paths, err := platform.ResolvePaths()
 	if err != nil {
@@ -206,6 +208,38 @@ func TestHandleSessionStart(t *testing.T) {
 		}
 		if bobAfter.LastUsedAt == nil || !bobAfter.LastUsedAt.Equal(now) {
 			t.Fatalf("bob LastUsedAt = %v, want %v", bobAfter.LastUsedAt, now)
+		}
+	})
+
+	t.Run("auto-enrolls new native token when SSH_TTY is set", func(t *testing.T) {
+		paths, st := setupIsolatedHookEnv(t)
+		t.Setenv("SSH_TTY", "multi-anti")
+
+		carol := makeHookAccount("carol@example.com", 0.75, "tok-carol", "ref-carol", now.Add(time.Hour))
+		writeNativeToken(t, paths, carol)
+
+		h := NewHandler(HandlerConfig{Store: st, Now: func() time.Time { return now }})
+		out, err := h.HandleSessionStart(ctx, []byte(`{"conversationId":"c-auto-enroll"}`))
+		if err != nil {
+			t.Fatalf("HandleSessionStart() error = %v", err)
+		}
+		if !strings.Contains(string(out), "carol@example.com") {
+			t.Fatalf("expected enrolled carol in session-start output: %s", out)
+		}
+
+		stAfter, err := st.Load(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stAfter.ActiveKey != carol.Key {
+			t.Fatalf("ActiveKey = %q, want %q", stAfter.ActiveKey, carol.Key)
+		}
+		got, ok := stAfter.Accounts[carol.Key]
+		if !ok || got.Creds.AccessToken != "tok-carol" || got.Creds.RefreshToken != "ref-carol" {
+			t.Fatalf("unexpected auto-enrolled carol: ok=%v acc=%+v", ok, got)
+		}
+		if got.LastUsedAt == nil || !got.LastUsedAt.Equal(now) {
+			t.Fatalf("carol LastUsedAt = %v, want %v", got.LastUsedAt, now)
 		}
 	})
 }
@@ -972,6 +1006,175 @@ func TestHandleStatusLine(t *testing.T) {
 		lines = strings.Split(out, "\n")
 		if len(lines) != 2 || !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "75%") || !strings.Contains(lines[1], "40%") || !strings.Contains(lines[1], "  -  ") || !strings.HasSuffix(lines[1], "active") {
 			t.Fatalf("unexpected models-only status table:\n%s", out)
+		}
+	})
+
+	t.Run("hides statusline when agy sends signed-out JSON payload", func(t *testing.T) {
+		paths, st := setupIsolatedHookEnv(t)
+		a := makeHookAccount("alice@example.com", 0.80, "tok-a", "ref-a", now.Add(time.Hour))
+		b := makeHookAccount("bob@example.com", 0.90, "tok-b", "ref-b", now.Add(time.Hour))
+		writeNativeToken(t, paths, a)
+
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = a.Key
+			s.Accounts[a.Key] = a
+			s.Accounts[b.Key] = b
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		h := NewHandler(HandlerConfig{Store: st, Now: func() time.Time { return now }})
+		signedOutPayloads := []string{
+			`{}`,
+			`{"email":""}`,
+			`{"agent_state":"idle","model":{"id":"gemini-4-neon"}}`,
+			`{"email":"","plan_tier":"","quota":{}}`,
+			`{"email":"","quota":{"gemini-5h":{}}}`,
+		}
+
+		for _, payload := range signedOutPayloads {
+			line, err := h.HandleStatusLine(ctx, []byte(payload))
+			if err != nil {
+				t.Fatalf("HandleStatusLine(%s) with native token error = %v", payload, err)
+			}
+			if line != "" {
+				t.Fatalf("HandleStatusLine(%s) with native token = %q, want empty", payload, line)
+			}
+		}
+
+		if err := os.Remove(paths.NativeAgyTokenPath()); err != nil {
+			t.Fatal(err)
+		}
+		for _, payload := range signedOutPayloads {
+			line, err := h.HandleStatusLine(ctx, []byte(payload))
+			if err != nil {
+				t.Fatalf("HandleStatusLine(%s) without native token error = %v", payload, err)
+			}
+			if line != "" {
+				t.Fatalf("HandleStatusLine(%s) without native token = %q, want empty", payload, line)
+			}
+		}
+
+		// Empty stdin still renders the managed table for manual CLI preview.
+		preview, err := h.HandleStatusLine(ctx, nil)
+		if err != nil {
+			t.Fatalf("HandleStatusLine(empty) error = %v", err)
+		}
+		if !strings.Contains(preview, "alice@example.com") || !strings.Contains(preview, "bob@example.com") {
+			t.Fatalf("expected managed preview on empty stdin, got:\n%s", preview)
+		}
+
+		// Signed-in JSON renders the managed table.
+		signedIn, err := h.HandleStatusLine(ctx, []byte(`{"email":"alice@example.com"}`))
+		if err != nil {
+			t.Fatalf("HandleStatusLine(signed-in) error = %v", err)
+		}
+		if !strings.Contains(signedIn, "alice@example.com") || !strings.Contains(signedIn, "bob@example.com") {
+			t.Fatalf("expected status table for signed-in payload, got:\n%s", signedIn)
+		}
+
+		// Empty store with signed-out JSON also stays hidden.
+		_, emptyStore := setupIsolatedHookEnv(t)
+		emptyHandler := NewHandler(HandlerConfig{Store: emptyStore, Now: func() time.Time { return now }})
+		for _, payload := range []string{`{}`, `{"email":""}`} {
+			line, err := emptyHandler.HandleStatusLine(ctx, []byte(payload))
+			if err != nil {
+				t.Fatalf("empty store HandleStatusLine(%s) error = %v", payload, err)
+			}
+			if line != "" {
+				t.Fatalf("empty store HandleStatusLine(%s) = %q, want empty", payload, line)
+			}
+		}
+	})
+
+	t.Run("auto-enrolls /login account and soft-syncs /logout under SSH_TTY", func(t *testing.T) {
+		paths, st := setupIsolatedHookEnv(t)
+		carol := makeHookAccount("carol@example.com", 0.88, "tok-carol", "ref-carol", now.Add(time.Hour))
+		writeNativeToken(t, paths, carol)
+
+		h := NewHandler(HandlerConfig{Store: st, Now: func() time.Time { return now }})
+		out, err := h.HandleStatusLine(ctx, []byte(`{"email":"carol@example.com","plan_tier":"g1-pro-tier","quota":{"gemini-5h":{"remaining_fraction":0.88}}}`))
+		if err != nil {
+			t.Fatalf("HandleStatusLine(/login) error = %v", err)
+		}
+		if !strings.Contains(out, "* carol@example.com") || !strings.Contains(out, "88%/-") {
+			t.Fatalf("unexpected statusline after auto-enroll:\n%s", out)
+		}
+
+		stAfter, err := st.Load(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stAfter.ActiveKey != carol.Key {
+			t.Fatalf("ActiveKey = %q, want %q", stAfter.ActiveKey, carol.Key)
+		}
+		gotCarol, ok := stAfter.Accounts[carol.Key]
+		if !ok || gotCarol.Creds.AccessToken != "tok-carol" || gotCarol.Quota == nil || len(gotCarol.Quota.Buckets) == 0 || gotCarol.Quota.Buckets[0].RemainingFraction != 0.88 {
+			t.Fatalf("carol not enrolled with merged quota: ok=%v acc=%+v", ok, gotCarol)
+		}
+
+		stranger := makeHookAccount("stranger@example.com", 0.50, "tok-stranger", "ref-stranger", now.Add(time.Hour))
+		writeNativeToken(t, paths, stranger)
+		if _, err := h.HandleStatusLine(ctx, []byte(`{"email":"carol@example.com"}`)); err != nil {
+			t.Fatalf("HandleStatusLine(mismatch) error = %v", err)
+		}
+		stMismatch, _ := st.Load(ctx)
+		if _, added := stMismatch.Accounts[stranger.Key]; added || stMismatch.ActiveKey != carol.Key {
+			t.Fatalf("mismatched token file leaked into store: %+v", stMismatch)
+		}
+
+		writeNativeToken(t, paths, carol)
+		t.Setenv("SSH_TTY", "multi-anti")
+
+		outStartup, err := h.HandleStatusLine(ctx, []byte(`{}`))
+		if err != nil || outStartup != "" {
+			t.Fatalf("startup signed-out payload got out=%q err=%v, want empty", outStartup, err)
+		}
+		stTransient, _ := st.Load(ctx)
+		if stTransient.ActiveKey != carol.Key {
+			t.Fatalf("startup transient cleared ActiveKey while token file existed: %q", stTransient.ActiveKey)
+		}
+
+		if err := os.Remove(paths.NativeAgyTokenPath()); err != nil {
+			t.Fatal(err)
+		}
+		outLogout, err := h.HandleStatusLine(ctx, []byte(`{}`))
+		if err != nil || outLogout != "" {
+			t.Fatalf("logout payload got out=%q err=%v, want empty", outLogout, err)
+		}
+		stLogout, _ := st.Load(ctx)
+		if stLogout.ActiveKey != "" {
+			t.Fatalf("ActiveKey = %q after /logout, want empty", stLogout.ActiveKey)
+		}
+		if _, stillKept := stLogout.Accounts[carol.Key]; !stillKept {
+			t.Fatalf("soft-sync /logout deleted managed account %q", carol.Key)
+		}
+
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = carol.Key
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Setenv("SSH_TTY", "")
+		if outDesktop, err := h.HandleStatusLine(ctx, []byte(`{}`)); err != nil || outDesktop != "" {
+			t.Fatalf("desktop signed-out got out=%q err=%v", outDesktop, err)
+		}
+		stDesktop, _ := st.Load(ctx)
+		if stDesktop.ActiveKey != carol.Key {
+			t.Fatalf("desktop mode without SSH_TTY cleared ActiveKey: %q", stDesktop.ActiveKey)
+		}
+
+		t.Setenv("SSH_TTY", "multi-anti")
+		t.Setenv("MULTI_ANTI_ISOLATED", "1")
+		if outIso, err := h.HandleStatusLine(ctx, []byte(`{}`)); err != nil || outIso != "" {
+			t.Fatalf("isolated signed-out got out=%q err=%v", outIso, err)
+		}
+		stIso, _ := st.Load(ctx)
+		if stIso.ActiveKey != carol.Key {
+			t.Fatalf("isolated session cleared global ActiveKey: %q", stIso.ActiveKey)
 		}
 	})
 }
