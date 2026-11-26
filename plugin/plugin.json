@@ -1,6 +1,6 @@
 {
   "name": "multi-anti",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Multi-account OAuth quota monitor and automatic rotation plugin for Antigravity CLI.",
   "logo": "assets/logo.svg"
 }
