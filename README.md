@@ -1,6 +1,6 @@
 # multi-anti
 
-`multi-anti` manages multiple Google Antigravity CLI (`agy`) OAuth accounts, monitors CloudCode quota pools (`gemini`, `3p`, `gemini-argon`), and rotates accounts automatically when quota is exhausted. It builds with the Go standard library only and has zero external Go dependencies.
+`multi-anti` manages multiple Google Antigravity CLI (`agy`) OAuth accounts, monitors CloudCode quota pools (`gemini`, `3p`), and rotates accounts automatically when quota is exhausted. It builds with the Go standard library only and has zero external Go dependencies.
 
 ## Prerequisites
 
@@ -221,7 +221,7 @@ multi-anti quota
 multi-anti doctor
 ```
 
-`multi-anti quota` (and its `multi-anti usage` alias) prints a ranked account table followed by a compact per-account breakdown across `gemini`, `claude/gpt`, and `argon`, showing both `5h` and `wk` remaining percentages (to 2 decimal places) with reset countdowns.
+`multi-anti quota` (and its `multi-anti usage` alias) prints a ranked account table followed by a compact per-account breakdown across `gemini` and `claude/gpt`, showing both `5h` and `wk` remaining percentages (to 2 decimal places) with reset countdowns.
 
 Without OAuth `client_id`, `multi-anti quota` fetches live quota while an account's `access_token` is valid for about 1 hour, and falls back to cached quota with `stale (set OAuth client_id to refresh offline)` once an idle account's token expires.
 
@@ -235,23 +235,23 @@ Run `agy` through `multi-anti run` so `multi-anti` selects the best ready accoun
 # Run a headless prompt with automatic failover on 429 or RESOURCE_EXHAUSTED
 multi-anti run -- -p "Review this repository"
 
-# Run interactively with automatic relaunch when the Stop hook switches accounts
-multi-anti run --auto-relaunch --
+# Run interactively (live failover and `-i continue` relaunch on quota exhaustion are enabled by default)
+multi-anti run --
 
 # Target a specific model and pool while keeping per-account HOME isolation
 multi-anti run --isolate --model claude-sonnet-4-5 -- -p "Summarize recent changes"
 ```
 
-To invoke `multi-anti run --auto-relaunch --` whenever you type `agy`, add an alias or function to your shell profile:
+To invoke `multi-anti run --` whenever you type `agy`, add an alias or function to your shell profile:
 
 ```bash
 # Bash or Zsh (~/.bashrc or ~/.zshrc)
-alias agy='multi-anti run --auto-relaunch --'
+alias agy='multi-anti run --'
 ```
 
 ```powershell
 # PowerShell ($PROFILE)
-function agy { multi-anti run --auto-relaunch -- @args }
+function agy { multi-anti run -- @args }
 ```
 
 When that alias is active, run `command agy` in Bash or Zsh, or `agy.exe` in PowerShell, if you need to call native `agy` directly.
@@ -275,7 +275,7 @@ $env:SSH_TTY = "multi-anti"
 
 - **Direct `agy` without `SSH_TTY`.** Desktop `agy` writes credentials to OS Keyring or Windows Credential Manager and runs a local browser loopback OAuth flow, which does not enroll accounts into `state.json`. Note that `agy` 1.5.14+ still falls back to reading `~/.gemini/antigravity-cli/antigravity-oauth-token` when OS Keyring is empty, so direct `agy` will pick up a previously staged native token unless you remove that account or run `multi-anti restore`. If browser loopback sign-in fails with `consumerOAuth: token exchange failed`, sign in with `multi-anti login` instead; it runs `agy` inside a clean isolated profile with `SSH_TTY=multi-anti` using `https://antigravity.google/oauth-callback` code paste.
 - **Direct `agy` with `SSH_TTY=multi-anti` or `multi-anti run`.** Once the `multi-anti` plugin is installed, `SessionStart`, `Stop`, and `statusline` hooks (along with `multi-anti run` on exit) automatically synchronize `/login` and `/logout` with `state.json`. Running `/login` inside `agy` enrolls a new account or updates fresher credentials for an existing account and sets `active_key`; running `/logout` deletes the native token file, hides the status line, and clears `active_key` while keeping saved accounts in `state.json`.
-- **`next` or `switch` vs `run`.** The default policy mode (`highest_remaining`) causes plain `multi-anti run` to re-pick whichever ready account currently has the most remaining quota. After `multi-anti next` or `multi-anti switch <account>`, pass `multi-anti run --account <key>`, launch `SSH_TTY=multi-anti agy` directly, or run `multi-anti policy --mode fill_first` so `multi-anti run` keeps the active account selected until exhausted.
+- **`next` or `switch` vs `run`.** The default policy mode (`highest_remaining` with `target_pool=all`) evaluates each account by its lowest remaining pool (`gemini` and `3p`) and causes plain `multi-anti run` to re-pick whichever eligible account currently has the most remaining quota. If an account hits `0%` in one pool (for example `3p`) while another pool (such as `gemini`) still has quota, `fill_first` still treats it as exhausted under `target_pool=all`; pass `multi-anti run --account <key>`, target a specific pool (`--pool gemini` or `multi-anti policy --pool gemini`), or launch direct `agy` with `SSH_TTY=multi-anti` (in PowerShell, `$env:SSH_TTY = "multi-anti"`).
 
 ## CLI reference
 
@@ -283,31 +283,31 @@ $env:SSH_TTY = "multi-anti"
 
 - `multi-anti login [--no-browser] [--timeout 3m] [--priority N] [--alias <name>] [--no-refresh] [--agy-bin <path>] [--json]` authenticates a Google account. When `MULTI_ANTI_OAUTH_CLIENT_ID` and `DefaultClientID` are unset, it delegates sign-in to `agy` inside an isolated temporary profile, opens the Google OAuth URL unless `--no-browser` is passed, reads the pasted authorization code from `https://antigravity.google/oauth-callback`, and imports the token. When `client_id` is configured, it uses direct loopback OAuth PKCE on `127.0.0.1:51121` with manual redirect URL or code paste fallback. Pass `--agy-bin <path>` to override the `agy` executable path in fallback mode. `multi-anti` preserves existing `priority` and `alias` values when omitted on re-login.
 - `multi-anti import [path] [--native] [--priority N] [--alias <name>] [--no-refresh] [--json]` imports a native `antigravity-oauth-token` file (defaulting to `antigravity-oauth-token` inside `MULTI_ANTI_AGY_HOME` or user home when no path is given) or a multi-account JSON array or `{"accounts": ...}` export.
-- `multi-anti accounts [--json]` (also `list` or `ls`) syncs fresher native tokens for managed accounts and lists all managed accounts with active marker (`*`), tier, health or cooldown remaining, priority, per-pool quota columns (`GEMINI 5h/wk`, `CLAUDE/GPT 5h/wk`, `ARGON wk`), and last-used time, plus a note if `~/.gemini/antigravity-cli/antigravity-oauth-token` holds an unmanaged or different account. JSON outputs omit all OAuth tokens.
-- `multi-anti switch [email-or-key] [--model <m>] [--pool <gemini|3p|gemini-argon|all>] [--no-refresh] [--force] [--json]` stages a specific account into native `agy` storage, or picks the next eligible account when no target is provided. Refuses `disabled` and `needs_reauth` accounts, and refuses `cooldown` accounts unless `--force` is passed. When OAuth `client_id` is unset, `switch` still stages any account that has a `refresh_token` even if its `access_token` is expired or absent so `agy` refreshes it on launch.
-- `multi-anti next [--model <m>] [--pool <gemini|3p|gemini-argon|all>] [--no-refresh] [--json]` switches away from the active account to the next eligible account ranked by policy, staging accounts with a `refresh_token` even when `client_id` is unset.
+- `multi-anti accounts [--json]` (also `list` or `ls`) syncs fresher native tokens for managed accounts and lists all managed accounts with active marker (`*`), tier, health or cooldown remaining, priority, per-pool quota columns (`GEMINI 5h/wk` and `CLAUDE/GPT 5h/wk`), and last-used time, plus a note if `~/.gemini/antigravity-cli/antigravity-oauth-token` holds an unmanaged or different account. JSON outputs omit all OAuth tokens.
+- `multi-anti switch [email-or-key] [--model <m>] [--pool <gemini|3p|all>] [--no-refresh] [--force] [--json]` stages a specific account into native `agy` storage, or picks the next eligible account when no target is provided. Refuses `disabled` and `needs_reauth` accounts, and refuses `cooldown` accounts unless `--force` is passed. When OAuth `client_id` is unset, `switch` still stages any account that has a `refresh_token` even if its `access_token` is expired or absent so `agy` refreshes it on launch.
+- `multi-anti next [--model <m>] [--pool <gemini|3p|all>] [--no-refresh] [--json]` switches away from the active account to the next eligible account ranked by policy, staging accounts with a `refresh_token` even when `client_id` is unset.
 - `multi-anti enable <email-or-key>` and `multi-anti disable <email-or-key>` mark an account `ready` or `disabled`.
 - `multi-anti priority <email-or-key> <int>` sets an integer priority where higher values win tie-breaks and `priority` selection mode.
 - `multi-anti remove <email-or-key>` (also `rm`) deletes an account from `state.json`, clears `active_key` if matched, removes its isolated profile directory, and deletes `~/.gemini/antigravity-cli/antigravity-oauth-token` when that staged native token belongs to the removed account.
 
 ### Quota and execution
 
-- `multi-anti quota [--no-refresh|--cached] [--refresh] [--watch[=30s]] [--models] [--pool <gemini|3p|gemini-argon|all>] [--json]` (also `usage` or `status`) refreshes CloudCode quota across non-disabled accounts using up to 4 concurrent requests, ranks eligibility, and renders the summary ranking table followed by a compact per-account breakdown (`gemini`, `claude/gpt`, and `argon` showing `5h` and `wk` percentages to 2 decimal places and reset countdowns). Use `--models` for a per-model breakdown or `--watch` to poll periodically. When OAuth `client_id` is unset, `multi-anti quota` fetches live quota while an account's `access_token` is valid for about 1 hour and falls back to cached quota with a `stale (set OAuth client_id to refresh offline)` note once an idle account's `access_token` expires.
-- `multi-anti run [flags] [agy args...] [-- <agy args...>]` (also `agy`) selects the best ready account, stages credentials, and launches `agy`. Unrecognized flags before `--` (such as `-p`, `--print`, `--prompt`, `-c`, `--continue`, `--conversation`, `--effort`, and `--dangerously-skip-permissions`) and all arguments after `--` pass through to `agy`. Passing `--model <val>` selects the matching account quota pool and forwards `--model <val>` to `agy`.
+- `multi-anti quota [--no-refresh|--cached] [--refresh] [--watch[=30s]] [--models] [--pool <gemini|3p|all>] [--json]` (also `usage` or `status`) refreshes CloudCode quota across non-disabled accounts using up to 4 concurrent requests, ranks eligibility, and renders the summary ranking table followed by a compact per-account breakdown (`gemini` and `claude/gpt` showing `5h` and `wk` percentages to 2 decimal places and reset countdowns). Use `--models` for a per-model breakdown or `--watch` to poll periodically. When OAuth `client_id` is unset, `multi-anti quota` fetches live quota while an account's `access_token` is valid for about 1 hour and falls back to cached quota with a `stale (set OAuth client_id to refresh offline)` note once an idle account's `access_token` expires.
+- `multi-anti run [flags] [agy args...] [-- <agy args...>]` (also `agy`) selects the best ready account, stages credentials, and launches `agy`. Always pass `--account <email-or-key>` to choose an account; bare email addresses or managed account names placed before `--` (not after `-p` or another value flag) are rejected before modifying state or invoking `agy`. Unrecognized flags before `--` (such as `-p`, `--print`, `--prompt`, `-c`, `--continue`, `--conversation`, `--effort`, and `--dangerously-skip-permissions`) and all arguments after `--` pass through to `agy`. Passing `--model <val>` selects the matching account quota pool and forwards `--model <val>` to `agy`.
   - `--account <email-or-key>` forces a specific account.
   - `--model <model>` targets the pool for that model and forwards `--model` to `agy`.
-  - `--pool <gemini|3p|gemini-argon>` overrides the target quota pool for selection.
+  - `--pool <gemini|3p>` overrides the target quota pool for selection.
   - `--isolate` runs `agy` in a per-account profile home directory.
   - `--no-refresh` skips the pre-launch quota refresh.
-  - `--auto-relaunch` relaunches interactive `agy` with `--conversation` if the `Stop` hook switches accounts.
-  - `--max-switches <N>` caps automatic switch-and-relaunch attempts (default `3`).
+  - `--auto-relaunch` / `--no-auto-relaunch` controls automatic live failover and continuation (`--conversation <id> -i continue`) when the `Stop` hook switches accounts in interactive mode (enabled by default).
+  - `--max-switches <N>` caps automatic switch-and-relaunch attempts (defaults to `max(3, account_count)`).
   - `--agy-bin <path>` overrides the `agy` executable path.
-- `multi-anti policy [--mode highest_remaining|fill_first|round_robin|priority] [--threshold <0..1>] [--cooldown <dur>] [--refresh-skew <dur>] [--pool <gemini|3p|gemini-argon|all>] [--json]` displays or updates the account selection policy. Defaults are `mode=highest_remaining`, `threshold=0.05`, `cooldown=5m`, `refresh_skew=5m`, and `target_pool=all`.
+- `multi-anti policy [--mode highest_remaining|fill_first|round_robin|priority] [--threshold <0..1>] [--cooldown <dur>] [--refresh-skew <dur>] [--pool <gemini|3p|all>] [--json]` displays or updates the account selection policy. Defaults are `mode=highest_remaining`, `threshold=0.05`, `cooldown=5m`, `refresh_skew=5m`, and `target_pool=all`.
 
 ### Plugin, hooks, diagnostics, and restore
 
 - `multi-anti plugin <install|uninstall|status> [--bin <path>] [--no-statusline] [--json]` installs, removes, or inspects the embedded plugin bundle in `~/.gemini/config/plugins/multi-anti` and configures `statusLine` in `agy` `settings.json`.
-- `multi-anti statusline [install|uninstall|render] [--bin <path>]` configures or renders a compact multi-line `agy` status table showing all managed accounts (`*` active, `>` next, standby, cooldown) with `GEMINI 5h/wk`, `CLAUDE/GPT 5h/wk`, `ARGON wk`, and status (defaults to `render`). It outputs nothing when `agy` sends a signed-out status payload (no `email` and no quota data).
+- `multi-anti statusline [install|uninstall|render] [--bin <path>]` configures or renders a compact multi-line `agy` status table showing all managed accounts (`*` active, `>` next, standby, cooldown) with `GEMINI 5h/wk`, `CLAUDE/GPT 5h/wk`, and status (defaults to `render`). It outputs nothing when `agy` sends a signed-out status payload (no `email` and no quota data).
 - `multi-anti hook <session-start|stop>` handles `agy` plugin hook events for `SessionStart` and `Stop`.
 - `multi-anti doctor [--json]` checks the `agy` binary and version, `state.json`, native backup SHA256 integrity, account health and refresh token presence, plugin files, `agy plugin validate --strict`, `statusLine` configuration, `SSH_TTY`, and an `[INFO]` `oauth_client` line noting whether OAuth client credentials are configured or using `agy` fallback.
 - `multi-anti restore` (also `restore-native`) restores the pre-`multi-anti` native `antigravity-oauth-token` (or removes it if none existed originally) and restores the prior `statusLine` setting.
@@ -316,10 +316,10 @@ $env:SSH_TTY = "multi-anti"
 
 ## Auto-switch mechanics
 
-1. **Pre-launch selection.** `multi-anti run` refreshes non-disabled accounts unless `--no-refresh` is set, picks the highest-ranked ready account for the target pool (`gemini`, `3p`, or `gemini-argon`), and writes the `agy` token file. When OAuth `client_id` is configured, it refreshes expiring OAuth tokens under `refresh.lock`. When `client_id` is unset, `multi-anti run`, `switch`, and `next` still stage accounts that have a `refresh_token` even when `access_token` is expired or absent so `agy` refreshes the token on launch.
-2. **SessionStart hook.** Displays the active account, remaining quota percentage, and ready count in the UI without injecting prompt bloat into model context.
-3. **Stop hook.** When `agy` stops with a quota exhaustion error (`429`, `RESOURCE_EXHAUSTED`, spend cap, or window limit), `multi-anti hook stop` places the failing account on cooldown until reset, stages the next ready account, and writes a switch signal in `signals/`. It stages standby accounts that have a `refresh_token` even without OAuth `client_id`.
-4. **Automatic retry and relaunch.** In headless mode (`-p`, `--print`, or `--prompt`), `multi-anti run` detects either the `Stop` hook signal or captured `429` or `RESOURCE_EXHAUSTED` output. It places the exhausted account on cooldown and retries with the next ready account up to `--max-switches` (default `3`). When the `Stop` signal provides `conversationId` and `--isolate` is off, the retry preserves conversation context with `--conversation`. In interactive mode, `--auto-relaunch` relaunches `agy` with `--conversation` when the `Stop` hook records a switch.
+1. **Pre-launch selection.** `multi-anti run` refreshes non-disabled accounts unless `--no-refresh` is set, picks the highest-ranked ready account for the target pool (`gemini` or `3p`), and writes the `agy` token file. When OAuth `client_id` is configured, it refreshes expiring OAuth tokens under `refresh.lock`. When `client_id` is unset, `multi-anti run`, `switch`, and `next` still stage accounts that have a `refresh_token` even when `access_token` is expired or absent so `agy` refreshes the token on launch.
+2. **SessionStart hook.** Displays the active account, remaining quota percentage, and ready count in the UI without injecting prompt bloat into model context. Cached quota displays and selection automatically treat any window whose scheduled `reset_at` has passed as `100%` reset.
+3. **Stop hook.** When `agy` stops with a quota exhaustion error (`429`, `RESOURCE_EXHAUSTED`, spend cap, or window limit), `multi-anti hook stop` resolves subagent `conversationId`s back to the root user conversation, places the failing account on cooldown until reset, stages the next ready account, and writes a per-run switch signal (`signals/run-<id>.json`). It stages standby accounts that have a `refresh_token` even without OAuth `client_id`.
+4. **Automatic retry and live interactive continuation.** In headless mode (`-p`, `--print`, or `--prompt`), `multi-anti run` detects either the `Stop` hook signal or captured `429` or `RESOURCE_EXHAUSTED` output, cools down the exhausted account, and retries with the next ready account. In interactive mode (enabled by default unless `--no-auto-relaunch` is set), `multi-anti run` watches `signals/run-<id>.json` while `agy` runs; when a quota switch fires, it cleanly terminates the in-memory `agy` session and relaunches with `--conversation <root-id> -i continue` so execution resumes on the newly staged account.
 5. **Token sync-back and `/login` / `/logout` sync.** After `agy` exits (and during `SessionStart` or `statusline` hooks under `SSH_TTY=multi-anti`), `multi-anti` writes refreshed OAuth tokens back to `state.json`, automatically enrolls new accounts signed in via `/login` and switches `active_key`, and soft-clears `active_key` while preserving saved accounts if `/logout` removed the staged native token.
 
 ## Isolated profiles with `--isolate`
@@ -363,6 +363,7 @@ These environment variables configure `multi-anti` or are passed to child `agy` 
 | `MULTI_ANTI_MANAGED` | Set to `1` in the child `agy` environment when launched by `multi-anti run`. |
 | `MULTI_ANTI_ACCOUNT` | Set in the child `agy` environment to identify the launched account key. |
 | `MULTI_ANTI_ISOLATED` | Set to `1` in the child `agy` environment when launched with `--isolate`. |
+| `MULTI_ANTI_RUN_ID` | Set in the child `agy` environment so `multi-anti hook stop` writes a per-run switch signal (`signals/run-<id>.json`) for live interactive continuation. |
 | `SSH_TTY` | Set to `multi-anti` in the child `agy` environment so `agy` reads the staged token file instead of OS Keyring or Windows Credential Manager. |
 
 ## Upgrade

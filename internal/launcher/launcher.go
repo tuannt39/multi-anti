@@ -2,24 +2,34 @@ package launcher
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tuannt/multi-anti/internal/domain"
 	"github.com/tuannt/multi-anti/internal/hook"
 	"github.com/tuannt/multi-anti/internal/oauth"
+	"github.com/tuannt/multi-anti/internal/platform"
 	"github.com/tuannt/multi-anti/internal/quota"
 	"github.com/tuannt/multi-anti/internal/selector"
 	"github.com/tuannt/multi-anti/internal/store"
 )
 
-const headlessCaptureMaxBytes = 64 * 1024
+const (
+	headlessCaptureMaxBytes   = 64 * 1024
+	defaultSignalPollInterval = 200 * time.Millisecond
+	defaultSignalGraceDelay   = 400 * time.Millisecond
+)
 
 // RunOptions configures launching and managing an agy child process.
 type RunOptions struct {
@@ -32,8 +42,10 @@ type RunOptions struct {
 	NoRefresh    bool
 	AutoRelaunch bool
 	// MaxSwitches caps automatic switch-and-relaunch attempts after the initial run (0 disables relaunches).
-	MaxSwitches int
-	Stdin       io.Reader
+	MaxSwitches        int
+	SignalPollInterval time.Duration
+	SignalGraceDelay   time.Duration
+	Stdin              io.Reader
 	Stdout      io.Writer
 	Stderr      io.Writer
 	ExtraEnv    []string
@@ -83,7 +95,11 @@ func Run(
 	}
 
 	paths := st.Paths()
-	_ = hook.ClearSwitchSignals(paths)
+	runID := newRunID()
+	_ = os.Remove(hook.LatestSignalPath(paths))
+	defer func() {
+		_ = hook.ClearRunSwitchSignal(paths, runID)
+	}()
 
 	headless := isHeadlessArgs(opts.Args)
 	args := slices.Clone(opts.Args)
@@ -134,7 +150,7 @@ func Run(
 		}
 
 		cmd := exec.CommandContext(ctx, binary, args...)
-		cmd.Env = mergeEnv(prepared.Env, opts.ExtraEnv)
+		cmd.Env = mergeEnv(mergeEnv(prepared.Env, []string{"MULTI_ANTI_RUN_ID=" + runID}), opts.ExtraEnv)
 
 		var capBuf *cappedTailBuffer
 		if headless {
@@ -168,89 +184,59 @@ func Run(
 			}
 		}
 
-		runErr := cmd.Run()
+		var (
+			liveSig    domain.HookSwitchSignal
+			hasLiveSig bool
+			runErr     error
+		)
+		if !headless && opts.AutoRelaunch && switchesUsed < opts.MaxSwitches {
+			liveSig, hasLiveSig, runErr = runInteractiveWithSignalWatch(
+				ctx,
+				cmd,
+				paths,
+				runID,
+				prepared.Account.Key,
+				opts.SignalPollInterval,
+				opts.SignalGraceDelay,
+				cmd.Stderr,
+			)
+		} else {
+			runErr = cmd.Run()
+		}
 		syncSessionAuthAfterRun(ctx, st, prepared, nowFn().UTC())
 
 		if ctx.Err() != nil {
 			result.ExitCode = 1
-			_ = hook.ClearSwitchSignals(paths)
 			return result, ctx.Err()
 		}
 
-		sig, hasSignal, _ := hook.ReadLatestSwitchSignal(paths)
-		if hasSignal {
-			_ = hook.ClearSwitchSignals(paths)
-		}
+		sig, hasSignal := resolveConsumedSwitchSignal(paths, runID, prepared.Account.Key, liveSig, hasLiveSig)
 
 		if runErr == nil {
 			result.ExitCode = 0
-			if !headless && opts.AutoRelaunch && switchesUsed < opts.MaxSwitches && hasSignal && sig.ToKey != "" && sig.ToKey != prepared.Account.Key {
-				excluded[prepared.Account.Key] = true
-				result.Switches = append(result.Switches, domain.SwitchAuditEntry{
-					At:      sig.At,
-					Outcome: domain.OutcomeSwitched,
-					FromKey: prepared.Account.Key,
-					ToKey:   sig.ToKey,
-					Reason:  sig.Reason,
-					Trigger: "hook_stop",
-				})
-				if !opts.Isolate {
-					args = withConversationArg(args, sig.ConversationID, false)
-				}
-				nextAccount = sig.ToKey
-				switchesUsed++
-				continue
+		} else {
+			var exitErr *exec.ExitError
+			if !errors.As(runErr, &exitErr) {
+				result.ExitCode = 1
+				return result, runErr
 			}
-			return result, nil
+			result.ExitCode = exitErr.ExitCode()
 		}
-
-		var exitErr *exec.ExitError
-		if !errors.As(runErr, &exitErr) {
-			result.ExitCode = 1
-			return result, runErr
-		}
-		result.ExitCode = exitErr.ExitCode()
 
 		if !headless {
 			if opts.AutoRelaunch && switchesUsed < opts.MaxSwitches && hasSignal && sig.ToKey != "" && sig.ToKey != prepared.Account.Key {
-				excluded[prepared.Account.Key] = true
-				result.Switches = append(result.Switches, domain.SwitchAuditEntry{
-					At:      sig.At,
-					Outcome: domain.OutcomeSwitched,
-					FromKey: prepared.Account.Key,
-					ToKey:   sig.ToKey,
-					Reason:  sig.Reason,
-					Trigger: "hook_stop",
-				})
-				if !opts.Isolate {
-					args = withConversationArg(args, sig.ConversationID, false)
-				}
-				nextAccount = sig.ToKey
-				switchesUsed++
+				nextAccount, args, switchesUsed = recordStopHookSwitch(&result, excluded, prepared.Account.Key, sig, args, opts.Isolate, false, switchesUsed)
 				continue
 			}
 			return result, nil
 		}
 
-		if switchesUsed >= opts.MaxSwitches {
+		if runErr == nil || switchesUsed >= opts.MaxSwitches {
 			return result, nil
 		}
 
-		if hasSignal && sig.ToKey != "" {
-			excluded[prepared.Account.Key] = true
-			result.Switches = append(result.Switches, domain.SwitchAuditEntry{
-				At:      sig.At,
-				Outcome: domain.OutcomeSwitched,
-				FromKey: prepared.Account.Key,
-				ToKey:   sig.ToKey,
-				Reason:  sig.Reason,
-				Trigger: "hook_stop",
-			})
-			if !opts.Isolate {
-				args = withConversationArg(args, sig.ConversationID, true)
-			}
-			nextAccount = sig.ToKey
-			switchesUsed++
+		if hasSignal && sig.ToKey != "" && sig.ToKey != prepared.Account.Key {
+			nextAccount, args, switchesUsed = recordStopHookSwitch(&result, excluded, prepared.Account.Key, sig, args, opts.Isolate, true, switchesUsed)
 			continue
 		}
 
@@ -323,7 +309,7 @@ func markHeadlessCooldown(
 			t := now.Add(*retryDur).UTC()
 			resetAt = &t
 		} else if acc.Quota != nil {
-			if _, poolReset, hasPool := acc.Quota.PoolRemaining(pool); hasPool && poolReset != nil && poolReset.After(now) {
+			if _, poolReset, hasPool := acc.Quota.PoolRemainingAt(pool, now); hasPool && poolReset != nil && poolReset.After(now) {
 				t := poolReset.UTC()
 				resetAt = &t
 			}
@@ -348,7 +334,252 @@ func isHeadlessArgs(args []string) bool {
 	return false
 }
 
-func withConversationArg(args []string, cid string, forceUpdate bool) []string {
+func newRunID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return fmt.Sprintf("%d-%s", os.Getpid(), hex.EncodeToString(b[:]))
+	}
+	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UTC().UnixNano())
+}
+
+func runInteractiveWithSignalWatch(
+	ctx context.Context,
+	cmd *exec.Cmd,
+	paths platform.Paths,
+	runID string,
+	fromKey domain.AccountKey,
+	pollInterval time.Duration,
+	graceDelay time.Duration,
+	stderr io.Writer,
+) (domain.HookSwitchSignal, bool, error) {
+	if pollInterval <= 0 {
+		pollInterval = defaultSignalPollInterval
+	}
+	if graceDelay <= 0 {
+		graceDelay = defaultSignalGraceDelay
+	}
+	if err := cmd.Start(); err != nil {
+		return domain.HookSwitchSignal{}, false, err
+	}
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-waitCh:
+			return domain.HookSwitchSignal{}, false, err
+		case <-ctx.Done():
+			terminateInteractiveChild(cmd, waitCh)
+			return domain.HookSwitchSignal{}, false, ctx.Err()
+		case <-ticker.C:
+			s, ok, _ := hook.ReadRunSwitchSignal(paths, runID)
+			if !ok || s.ToKey == "" || s.ToKey == fromKey {
+				continue
+			}
+			graceTimer := time.NewTimer(graceDelay)
+			var childErr error
+			exitedEarly := false
+			select {
+			case childErr = <-waitCh:
+				graceTimer.Stop()
+				exitedEarly = true
+			case <-ctx.Done():
+				graceTimer.Stop()
+				terminateInteractiveChild(cmd, waitCh)
+				return domain.HookSwitchSignal{}, false, ctx.Err()
+			case <-graceTimer.C:
+			}
+			if refreshed, refOK, _ := hook.ReadRunSwitchSignal(paths, runID); refOK && refreshed.ToKey != "" && refreshed.ToKey != fromKey {
+				s = refreshed
+			}
+			if exitedEarly {
+				return s, true, childErr
+			}
+			terminateInteractiveChild(cmd, waitCh)
+			if stderr != nil {
+				fmt.Fprintf(stderr, "\n[multi-anti] Quota exhausted on %s; switching to %s and continuing session...\n", fromKey, s.ToKey)
+			}
+			return s, true, nil
+		}
+	}
+}
+
+func terminateInteractiveChild(cmd *exec.Cmd, waitCh <-chan error) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		_ = cmd.Process.Kill()
+		<-waitCh
+		return
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-waitCh:
+	case <-time.After(2 * time.Second):
+		_ = cmd.Process.Kill()
+		<-waitCh
+	}
+}
+
+func resolveConsumedSwitchSignal(
+	paths platform.Paths,
+	runID string,
+	launchedKey domain.AccountKey,
+	liveSig domain.HookSwitchSignal,
+	hasLiveSig bool,
+) (domain.HookSwitchSignal, bool) {
+	sig := liveSig
+	hasSignal := hasLiveSig
+	if !hasSignal {
+		if runSig, ok, _ := hook.ReadRunSwitchSignal(paths, runID); ok && runSig.ToKey != "" {
+			sig = runSig
+			hasSignal = true
+		} else if latestSig, ok, _ := hook.ReadLatestSwitchSignal(paths); ok &&
+			(latestSig.FromKey == "" || latestSig.FromKey == launchedKey) {
+			if latestSig.ToKey != "" {
+				sig = latestSig
+				hasSignal = true
+			} else {
+				_ = os.Remove(hook.LatestSignalPath(paths))
+			}
+		}
+	}
+	_ = hook.ClearRunSwitchSignal(paths, runID)
+	if hasSignal {
+		_ = os.Remove(hook.LatestSignalPath(paths))
+		if cid := strings.TrimSpace(sig.ConversationID); cid != "" {
+			_ = os.Remove(hook.SignalPath(paths, cid))
+		}
+	}
+	return sig, hasSignal
+}
+
+func recordStopHookSwitch(
+	result *RunResult,
+	excluded map[domain.AccountKey]bool,
+	fromKey domain.AccountKey,
+	sig domain.HookSwitchSignal,
+	args []string,
+	isolate bool,
+	headless bool,
+	switchesUsed int,
+) (domain.AccountKey, []string, int) {
+	excluded[fromKey] = true
+	result.Switches = append(result.Switches, domain.SwitchAuditEntry{
+		At:      sig.At,
+		Outcome: domain.OutcomeSwitched,
+		FromKey: fromKey,
+		ToKey:   sig.ToKey,
+		Reason:  sig.Reason,
+		Trigger: "hook_stop",
+	})
+	if !isolate {
+		if headless {
+			args = withConversationArg(args, sig.ConversationID)
+		} else {
+			args = withInteractiveResumeArgs(args, sig.ConversationID)
+		}
+	}
+	return sig.ToKey, args, switchesUsed + 1
+}
+
+type parsedResumeFlag struct {
+	matched    bool
+	convID     string
+	isContinue bool
+	isConvFlag bool
+	eqPrefix   string
+	nextIndex  int
+}
+
+func parseResumeFlag(args []string, i int) parsedResumeFlag {
+	a := args[i]
+	switch {
+	case a == "--conversation" || a == "--resume" || a == "-r":
+		if i+1 < len(args) {
+			return parsedResumeFlag{matched: true, isConvFlag: true, convID: strings.TrimSpace(args[i+1]), nextIndex: i + 1}
+		}
+		return parsedResumeFlag{matched: true, isConvFlag: true, nextIndex: i}
+	case a == "-c" || a == "--continue":
+		return parsedResumeFlag{matched: true, isContinue: true, nextIndex: i}
+	}
+	for _, pref := range []string{"--conversation=", "--resume=", "-r="} {
+		if strings.HasPrefix(a, pref) {
+			return parsedResumeFlag{
+				matched:    true,
+				isConvFlag: true,
+				convID:     strings.TrimSpace(strings.TrimPrefix(a, pref)),
+				eqPrefix:   pref,
+				nextIndex:  i,
+			}
+		}
+	}
+	return parsedResumeFlag{nextIndex: i}
+}
+
+func withInteractiveResumeArgs(args []string, cid string) []string {
+	splitIdx := slices.Index(args, "--")
+	pre := args
+	var post []string
+	if splitIdx >= 0 {
+		pre = args[:splitIdx]
+		post = args[splitIdx:]
+	}
+
+	var existingCID string
+	hadContinue := false
+	filtered := make([]string, 0, len(pre))
+
+	for i := 0; i < len(pre); i++ {
+		if rf := parseResumeFlag(pre, i); rf.matched {
+			if rf.isContinue {
+				hadContinue = true
+			} else if existingCID == "" && rf.convID != "" {
+				existingCID = rf.convID
+			}
+			i = rf.nextIndex
+			continue
+		}
+		a := pre[i]
+		switch {
+		case a == "-i" || a == "--prompt-interactive":
+			if i+1 < len(pre) {
+				i++
+			}
+		case strings.HasPrefix(a, "-i=") || strings.HasPrefix(a, "--prompt-interactive="):
+		default:
+			filtered = append(filtered, a)
+		}
+	}
+
+	targetCID := strings.TrimSpace(cid)
+	if targetCID == "" {
+		targetCID = existingCID
+	}
+	var resume []string
+	switch {
+	case targetCID != "":
+		resume = []string{"--conversation", targetCID, "-i", "continue"}
+	case hadContinue:
+		resume = []string{"--continue", "-i", "continue"}
+	default:
+		return slices.Clone(args)
+	}
+
+	out := make([]string, 0, len(resume)+len(filtered)+len(post))
+	out = append(out, resume...)
+	out = append(out, filtered...)
+	out = append(out, post...)
+	return out
+}
+
+func withConversationArg(args []string, cid string) []string {
 	cleanID := strings.TrimSpace(cid)
 	out := slices.Clone(args)
 	if cleanID == "" {
@@ -357,26 +588,25 @@ func withConversationArg(args []string, cid string, forceUpdate bool) []string {
 
 	hasAnyResumeFlag := false
 	for i := 0; i < len(out); i++ {
-		a := out[i]
-		if a == "--" {
+		if out[i] == "--" {
 			break
 		}
-		switch {
-		case a == "--conversation":
-			hasAnyResumeFlag = true
-			if forceUpdate && i+1 < len(out) {
-				out[i+1] = cleanID
-				return out
-			}
-		case strings.HasPrefix(a, "--conversation="):
-			hasAnyResumeFlag = true
-			if forceUpdate {
-				out[i] = "--conversation=" + cleanID
-				return out
-			}
-		case a == "-c" || a == "--continue" || a == "--resume" || strings.HasPrefix(a, "--resume="):
-			hasAnyResumeFlag = true
+		rf := parseResumeFlag(out, i)
+		if !rf.matched {
+			continue
 		}
+		hasAnyResumeFlag = true
+		if rf.isConvFlag {
+			if rf.eqPrefix != "" {
+				out[i] = rf.eqPrefix + cleanID
+				return out
+			}
+			if rf.nextIndex > i {
+				out[rf.nextIndex] = cleanID
+				return out
+			}
+		}
+		i = rf.nextIndex
 	}
 
 	if hasAnyResumeFlag {

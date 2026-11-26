@@ -237,7 +237,7 @@ func (f *CloudCodeFetcher) retrieveUserQuotaSummary(
 		groupID := firstNonEmptyStr(b.BucketID, b.BucketIDSnake, b.GroupID, b.GroupIDSnake, b.QuotaGroupID, b.ModelGroup, b.ID, entry.parentID)
 		displayName := firstNonEmptyStr(b.DisplayName, b.DisplayNameSnake, entry.parentLabel)
 		resetTimeStr := firstNonEmptyStr(b.ResetTime, b.ResetTimeSnake)
-		resetAt, parseErr := parseOptionalTime(resetTimeStr)
+		resetAt, parseErr := ParseOptionalTime(resetTimeStr)
 		if parseErr != nil {
 			return nil, false, usedEP, fmt.Errorf("parse bucket %q resetTime: %w", groupID, parseErr)
 		}
@@ -246,7 +246,7 @@ func (f *CloudCodeFetcher) retrieveUserQuotaSummary(
 		if remPtr == nil {
 			remPtr = b.RemainingFractionSnake
 		}
-		remaining := resolveRemainingFraction(remPtr, resetTimeStr)
+		remaining := resolveRemainingFraction(remPtr, resetAt != nil)
 
 		pool := mapGroupToPool(groupID, displayName)
 		if pool == domain.PoolOther {
@@ -385,7 +385,7 @@ func (f *CloudCodeFetcher) fetchAvailableModels(
 			continue
 		}
 
-		resetAt, parseErr := parseOptionalTime(resetStr)
+		resetAt, parseErr := ParseOptionalTime(resetStr)
 		if parseErr != nil {
 			return nil, usedEP, fmt.Errorf("parse model %q resetTime: %w", modelID, parseErr)
 		}
@@ -393,7 +393,7 @@ func (f *CloudCodeFetcher) fetchAvailableModels(
 		models = append(models, domain.ModelQuota{
 			ModelID:           modelID,
 			DisplayName:       strings.TrimSpace(entry.DisplayName),
-			RemainingFraction: resolveRemainingFraction(remPtr, resetStr),
+			RemainingFraction: resolveRemainingFraction(remPtr, resetAt != nil),
 			ResetAt:           resetAt,
 			SupportsThinking:  entry.SupportsThinking,
 		})
@@ -1181,31 +1181,32 @@ func mapGroupToWindow(candidates ...string) domain.QuotaWindow {
 	return domain.WindowUnknown
 }
 
-func resolveRemainingFraction(remPtr *float64, resetTime string) float64 {
+func resolveRemainingFraction(remPtr *float64, hasReset bool) float64 {
 	if remPtr != nil {
 		return *remPtr
 	}
 	// Protobuf-JSON omits 0.0 float defaults while keeping resetTime when a bucket or model is exhausted.
-	if strings.TrimSpace(resetTime) != "" {
+	if hasReset {
 		return 0.0
 	}
 	return 1.0
 }
 
-func parseOptionalTime(raw string) (*time.Time, error) {
+// ParseOptionalTime parses an optional RFC3339 timestamp string, treating empty or non-positive Unix epochs as nil.
+func ParseOptionalTime(raw string) (*time.Time, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return nil, nil
 	}
-	if t, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
-		utc := t.UTC()
-		return &utc, nil
+	t, err := time.Parse(time.RFC3339Nano, trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("invalid RFC3339 timestamp %q", trimmed)
 	}
-	if t, err := time.Parse(time.RFC3339, trimmed); err == nil {
-		utc := t.UTC()
-		return &utc, nil
+	utc := t.UTC()
+	if utc.Unix() <= 0 {
+		return nil, nil
 	}
-	return nil, fmt.Errorf("invalid RFC3339 timestamp %q", trimmed)
+	return &utc, nil
 }
 
 func extractIDField(raw json.RawMessage) string {

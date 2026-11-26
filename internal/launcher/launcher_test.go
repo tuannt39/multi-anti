@@ -69,6 +69,7 @@ func setupLauncherEnv(t *testing.T) (realHome string, paths platform.Paths, st *
 	t.Setenv("USERPROFILE", realHome)
 	t.Setenv("MULTI_ANTI_HOME", filepath.Join(tmp, "data"))
 	t.Setenv("MULTI_ANTI_AGY_HOME", filepath.Join(tmp, "agy-home"))
+	t.Setenv("MULTI_ANTI_RUN_ID", "")
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("XDG_DATA_HOME", "")
 	t.Setenv("XDG_CACHE_HOME", "")
@@ -683,7 +684,7 @@ func main() {
 		if lines[0] != "alice@example.com|--model gemini-2.5-pro" {
 			t.Fatalf("attempt 1 = %q", lines[0])
 		}
-		if lines[1] != "bob@example.com|--conversation conv-interactive-77 --model gemini-2.5-pro" {
+		if lines[1] != "bob@example.com|--conversation conv-interactive-77 -i continue --model gemini-2.5-pro" {
 			t.Fatalf("attempt 2 = %q", lines[1])
 		}
 		if _, ok, _ := hook.ReadLatestSwitchSignal(paths); ok {
@@ -1018,4 +1019,174 @@ func mustReadFile(t *testing.T, path string) []byte {
 		t.Fatalf("ReadFile(%q) error = %v", path, err)
 	}
 	return b
+}
+
+func TestRunInteractiveLiveQuotaSwitchTerminatesStuckTUIAndContinues(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 25, 16, 40, 0, 0, time.UTC)
+
+	liveBin := buildFakeAgyBinary(t, `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+)
+
+func main() {
+	acct := os.Getenv("MULTI_ANTI_ACCOUNT")
+	if logFile := os.Getenv("FAKE_AGY_LOG"); logFile != "" {
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			os.Exit(9)
+		}
+		_, _ = f.WriteString(acct + "|" + strings.Join(os.Args[1:], " ") + "\n")
+		_ = f.Close()
+	}
+
+	switch os.Getenv("FAKE_AGY_LIVE_MODE") {
+	case "stuck_on_alice":
+		if acct == "alice@example.com" {
+			runID := os.Getenv("MULTI_ANTI_RUN_ID")
+			sigDir := filepath.Join(os.Getenv("MULTI_ANTI_HOME"), "signals")
+			_ = os.MkdirAll(sigDir, 0o700)
+			sig, _ := json.Marshal(map[string]any{
+				"conversation_id": "ceb19e39-6c65-41c8-8dfb-61ad2951a142",
+				"from_key":        "alice@example.com",
+				"to_key":          "bob@example.com",
+				"reason":          "switched from alice@example.com (health_cooldown) by highest_remaining",
+				"at":              time.Now().UTC().Format(time.RFC3339),
+			})
+			if runID != "" {
+				_ = os.WriteFile(filepath.Join(sigDir, "run-"+runID+".json"), sig, 0o600)
+			}
+			_ = os.WriteFile(filepath.Join(sigDir, "latest.json"), sig, 0o600)
+			fmt.Fprintln(os.Stderr, "Individual quota reached. Resets in 3h58m27s.")
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+			select {
+			case <-sigCh:
+				os.Exit(0)
+			case <-time.After(30 * time.Second):
+				os.Exit(42)
+			}
+		}
+		fmt.Fprintln(os.Stdout, "continued on "+acct)
+	case "ignore_foreign_latest":
+		sigDir := filepath.Join(os.Getenv("MULTI_ANTI_HOME"), "signals")
+		_ = os.MkdirAll(sigDir, 0o700)
+		foreignSig, _ := json.Marshal(map[string]any{
+			"conversation_id": "other-conv",
+			"from_key":        "other@example.com",
+			"to_key":          "bob@example.com",
+			"reason":          "foreign terminal switch",
+			"at":              time.Now().UTC().Format(time.RFC3339),
+		})
+		_ = os.WriteFile(filepath.Join(sigDir, "latest.json"), foreignSig, 0o600)
+		time.Sleep(100 * time.Millisecond)
+		fmt.Fprintln(os.Stdout, "finished cleanly on "+acct)
+	}
+}
+`)
+
+	t.Run("terminates stuck interactive agy on run signal and resumes with -i continue", func(t *testing.T) {
+		_, paths, st := setupLauncherEnv(t)
+		alice := makeLauncherAccount("alice@example.com", 0.90, "tok-alice", "ref-alice", now.Add(time.Hour))
+		bob := makeLauncherAccount("bob@example.com", 0.70, "tok-bob", "ref-bob", now.Add(time.Hour))
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.Accounts[alice.Key] = alice
+			s.Accounts[bob.Key] = bob
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		logPath := filepath.Join(t.TempDir(), "live.log")
+		var stdout, stderr bytes.Buffer
+		start := time.Now()
+		res, err := Run(ctx, st, nil, nil, nil, RunOptions{
+			Binary:             liveBin,
+			Args:               []string{"--conversation=ceb19e39-6c65-41c8-8dfb-61ad2951a142", "-i", "initial prompt", "--effort", "high"},
+			NoRefresh:          true,
+			AutoRelaunch:       true,
+			MaxSwitches:        2,
+			SignalPollInterval: 15 * time.Millisecond,
+			SignalGraceDelay:   25 * time.Millisecond,
+			Stdin:              strings.NewReader(""),
+			Stdout:             &stdout,
+			Stderr:             &stderr,
+			ExtraEnv:           []string{"FAKE_AGY_LIVE_MODE=stuck_on_alice", "FAKE_AGY_LOG=" + logPath},
+			Now:                func() time.Time { return now },
+		})
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if elapsed >= 3*time.Second {
+			t.Fatalf("expected live signal watcher to restart stuck agy within <3s, took %v", elapsed)
+		}
+		if res.ExitCode != 0 || res.LastAccount != bob.Key || len(res.Switches) != 1 {
+			t.Fatalf("unexpected RunResult: %+v (stderr=%s)", res, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "continued on bob@example.com") {
+			t.Fatalf("stdout = %q", stdout.String())
+		}
+
+		lines := strings.Split(strings.TrimSpace(string(mustReadFile(t, logPath))), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("expected 2 invocations, got %d: %v", len(lines), lines)
+		}
+		if lines[1] != "bob@example.com|--conversation ceb19e39-6c65-41c8-8dfb-61ad2951a142 -i continue --effort high" {
+			t.Fatalf("attempt 2 = %q", lines[1])
+		}
+		entries, err := os.ReadDir(paths.SignalsDir())
+		if err == nil {
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), "run-") {
+					t.Fatalf("expected run signal cleared, found %s", e.Name())
+				}
+			}
+		}
+	})
+
+	t.Run("ignores foreign terminal latest.json signal while interactive agy runs", func(t *testing.T) {
+		_, _, st := setupLauncherEnv(t)
+		alice := makeLauncherAccount("alice@example.com", 0.90, "tok-alice", "ref-alice", now.Add(time.Hour))
+		bob := makeLauncherAccount("bob@example.com", 0.70, "tok-bob", "ref-bob", now.Add(time.Hour))
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.Accounts[alice.Key] = alice
+			s.Accounts[bob.Key] = bob
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		logPath := filepath.Join(t.TempDir(), "isolated.log")
+		var stdout, stderr bytes.Buffer
+		res, err := Run(ctx, st, nil, nil, nil, RunOptions{
+			Binary:             liveBin,
+			Args:               []string{"--effort", "high"},
+			NoRefresh:          true,
+			AutoRelaunch:       true,
+			MaxSwitches:        2,
+			SignalPollInterval: 10 * time.Millisecond,
+			SignalGraceDelay:   10 * time.Millisecond,
+			Stdin:              strings.NewReader(""),
+			Stdout:             &stdout,
+			Stderr:             &stderr,
+			ExtraEnv:           []string{"FAKE_AGY_LIVE_MODE=ignore_foreign_latest", "FAKE_AGY_LOG=" + logPath},
+			Now:                func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if res.ExitCode != 0 || res.LastAccount != alice.Key || len(res.Switches) != 0 {
+			t.Fatalf("unexpected RunResult on foreign signal: %+v", res)
+		}
+	})
 }

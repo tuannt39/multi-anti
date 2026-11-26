@@ -224,7 +224,7 @@ func TestDefaultSelectorPoolIsolationAndCooldownPromotion(t *testing.T) {
 
 	sel := NewDefaultSelector()
 
-	t.Run("isolates Pool3P, PoolGemini, and PoolGeminiArgon across TargetPool and TargetModel", func(t *testing.T) {
+	t.Run("isolates Pool3P and PoolGemini across TargetPool and TargetModel", func(t *testing.T) {
 		t.Parallel()
 
 		state := domain.StoreState{
@@ -239,10 +239,6 @@ func TestDefaultSelectorPoolIsolationAndCooldownPromotion(t *testing.T) {
 					domain.QuotaBucket{Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.10},
 					domain.QuotaBucket{Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 0.85},
 				),
-				"argon@example.com": makeSelectorAccount("argon@example.com", 0, domain.AccountHealth{Status: domain.HealthReady}, nil,
-					domain.QuotaBucket{Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.20},
-					domain.QuotaBucket{Pool: domain.PoolGeminiArgon, Window: domain.WindowWeekly, RemainingFraction: 0.70},
-				),
 			},
 		}
 
@@ -256,17 +252,17 @@ func TestDefaultSelectorPoolIsolationAndCooldownPromotion(t *testing.T) {
 			t.Fatalf("Pool3P decision = %+v", dec3P)
 		}
 
-		decArgon := sel.Evaluate(state, EvalRequest{TargetModel: "gemini-argon", Now: now})
-		if decArgon.ToKey != "argon@example.com" || decArgon.Pool != domain.PoolGeminiArgon {
-			t.Fatalf("PoolGeminiArgon decision = %+v", decArgon)
+		decArgon := sel.Evaluate(state, EvalRequest{TargetModel: "gemini-4-argon-high", Now: now})
+		if decArgon.ToKey != "gem@example.com" || decArgon.Pool != domain.PoolGemini {
+			t.Fatalf("Argon model PoolGemini decision = %+v", decArgon)
 		}
 
 		ranked3P := sel.Rank(state, EvalRequest{TargetPool: domain.Pool3P, Now: now})
-		if len(ranked3P) != 3 || !ranked3P[0].Eligible || ranked3P[0].Key != "threep@example.com" {
+		if len(ranked3P) != 2 || !ranked3P[0].Eligible || ranked3P[0].Key != "threep@example.com" {
 			t.Fatalf("ranked3P = %+v", ranked3P)
 		}
-		if ranked3P[1].Eligible || ranked3P[2].Eligible {
-			t.Fatalf("expected non-eligible accounts for Pool3P: %+v", ranked3P)
+		if ranked3P[1].Eligible {
+			t.Fatalf("expected non-eligible account for Pool3P: %+v", ranked3P)
 		}
 	})
 
@@ -606,5 +602,37 @@ func TestMarkPoolExhausted5hPreservesWeeklyWindow(t *testing.T) {
 	rem, poolReset, ok := acc.Quota.PoolRemaining(domain.PoolGemini)
 	if !ok || rem != 0 || poolReset == nil || !poolReset.Equal(reset5h) {
 		t.Fatalf("PoolRemaining(PoolGemini) = (%v, %v, %v), want (0, %v, true)", rem, poolReset, ok, reset5h)
+	}
+}
+
+func TestArgonAndCarbonModelsSelectPoolGemini(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 25, 18, 0, 0, 0, time.UTC)
+	sel := NewDefaultSelector()
+	state := domain.StoreState{
+		SchemaVersion: domain.CurrentSchemaVersion,
+		Policy:        domain.DefaultSelectionPolicy(),
+		Accounts: map[domain.AccountKey]domain.Account{
+			"gem@example.com": makeSelectorAccount("gem@example.com", 0, domain.AccountHealth{Status: domain.HealthReady}, nil,
+				domain.QuotaBucket{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.90},
+				domain.QuotaBucket{GroupID: "gemini-weekly", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.95},
+				domain.QuotaBucket{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 0.10},
+				domain.QuotaBucket{GroupID: "3p-weekly", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0.10},
+			),
+			"threep@example.com": makeSelectorAccount("threep@example.com", 0, domain.AccountHealth{Status: domain.HealthReady}, nil,
+				domain.QuotaBucket{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.20},
+				domain.QuotaBucket{GroupID: "gemini-weekly", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.80},
+				domain.QuotaBucket{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 1.00},
+				domain.QuotaBucket{GroupID: "3p-weekly", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 1.00},
+			),
+		},
+	}
+
+	for _, model := range []string{"gemini-4-argon-high", "Argon (High)", "gemini-4-carbon-high", "Carbon (High)"} {
+		dec := sel.Evaluate(state, EvalRequest{TargetModel: model, Now: now})
+		if dec.Outcome != domain.OutcomeSwitched || dec.ToKey != "gem@example.com" || dec.Pool != domain.PoolGemini {
+			t.Fatalf("Evaluate(model=%q) = %+v, want switched to gem@example.com on PoolGemini", model, dec)
+		}
 	}
 }

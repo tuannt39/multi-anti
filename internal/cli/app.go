@@ -70,6 +70,7 @@ type App struct {
 	stdout        io.Writer
 	stderr        io.Writer
 	now           func() time.Time
+	goos          string
 	hasPaths      bool
 	pathsData     platform.Paths
 }
@@ -137,6 +138,7 @@ func NewApp(cfg Config) *App {
 		stdout:        stdout,
 		stderr:        stderr,
 		now:           nowFn,
+		goos:          runtime.GOOS,
 	}
 	if cfg.Store != nil {
 		app.pathsData = cfg.Store.Paths()
@@ -557,7 +559,6 @@ func (f *agyOutputForwarder) claimBrowserOpen() bool {
 	return true
 }
 
-// streamPipe forwards chunks immediately so prompts lacking a trailing newline still appear before stdin input.
 func (f *agyOutputForwarder) streamPipe(r io.Reader) {
 	const maxScanBuf = 16 * 1024
 	buf := make([]byte, 4096)
@@ -650,6 +651,7 @@ func buildAgyLoginEnv(base []string, tmpHome string) []string {
 		envKeyNorm("MULTI_ANTI_MANAGED"):  true,
 		envKeyNorm("MULTI_ANTI_ACCOUNT"):  true,
 		envKeyNorm("MULTI_ANTI_ISOLATED"): true,
+		envKeyNorm("MULTI_ANTI_RUN_ID"):   true,
 		envKeyNorm("MULTI_ANTI_HOME"):     true,
 		envKeyNorm("MULTI_ANTI_AGY_HOME"): true,
 		envKeyNorm("HOME"):                true,
@@ -1468,18 +1470,85 @@ func (a *App) switchToNextAccount(
 }
 
 func (a *App) printPostSwitchHints(state domain.StoreState, switchedKey domain.AccountKey, now time.Time) {
-	if state.Policy.Mode == domain.SwitchHighestRemaining {
-		eval := a.selector.Evaluate(state, selector.EvalRequest{
-			CurrentKey: switchedKey,
-			Now:        now,
-		})
-		if eval.Outcome == domain.OutcomeSwitched && eval.ToKey != "" && eval.ToKey != switchedKey {
-			fmt.Fprintf(a.stdout, "Note: policy mode is highest_remaining; run 'multi-anti run --account %s' to launch this account, or 'multi-anti policy --mode fill_first' to keep switched accounts active.\n", switchedKey)
+	ranked := a.selector.Rank(state, selector.EvalRequest{
+		CurrentKey: switchedKey,
+		Now:        now,
+	})
+	if len(ranked) > 0 && ranked[0].Eligible && ranked[0].Key != "" && ranked[0].Key != switchedKey {
+		if switchedScore, ok := findCandidateScore(ranked, switchedKey); ok && !switchedScore.Eligible {
+			fmt.Fprintln(a.stdout, formatIneligibleSwitchHint(state, switchedKey, ranked[0].Key, switchedScore.SkipReason, now))
+		} else if state.Policy.Mode != domain.SwitchFillFirst {
+			mode := state.Policy.Mode
+			if !mode.IsValid() {
+				mode = domain.SwitchHighestRemaining
+			}
+			fmt.Fprintf(a.stdout, "Note: policy mode is %s; run 'multi-anti run --account %s' to launch this account, or 'multi-anti policy --mode fill_first' to keep switched accounts active.\n", mode, switchedKey)
 		}
 	}
 	if strings.TrimSpace(os.Getenv("SSH_TTY")) == "" {
-		fmt.Fprintf(a.stdout, "Note: SSH_TTY is unset; launch via 'multi-anti run --account %s' or export SSH_TTY=multi-anti for direct agy.\n", switchedKey)
+		fmt.Fprintf(a.stdout, "Note: SSH_TTY is unset; launch via 'multi-anti run --account %s' or %s for direct agy.\n", switchedKey, sshTTYSetHint(a.goos))
 	}
+}
+
+func sshTTYSetHint(goos string) string {
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+	if goos == "windows" {
+		return `set $env:SSH_TTY="multi-anti" in PowerShell`
+	}
+	return "export SSH_TTY=multi-anti"
+}
+
+func findCandidateScore(scores []selector.CandidateScore, key domain.AccountKey) (selector.CandidateScore, bool) {
+	for _, s := range scores {
+		if s.Key == key {
+			return s, true
+		}
+	}
+	return selector.CandidateScore{}, false
+}
+
+func formatIneligibleSwitchHint(state domain.StoreState, switchedKey, fallbackKey domain.AccountKey, skipReason string, now time.Time) string {
+	if state.Policy.TargetPool == "" && (skipReason == "quota_exhausted" || skipReason == "below_threshold") {
+		if acc, ok := state.Accounts[switchedKey]; ok && acc.Quota != nil {
+			var depletedPools []string
+			var readyPools []domain.QuotaPool
+			allZero := true
+			for _, p := range []domain.QuotaPool{domain.PoolGemini, domain.Pool3P} {
+				rem, _, hasPool := acc.Quota.PoolRemainingAt(p, now)
+				if !hasPool {
+					continue
+				}
+				if rem <= 0 {
+					depletedPools = append(depletedPools, string(p))
+				} else if rem < state.Policy.MinRemainingThreshold {
+					depletedPools = append(depletedPools, string(p))
+					allZero = false
+				} else {
+					readyPools = append(readyPools, p)
+				}
+			}
+			if len(depletedPools) > 0 && len(readyPools) > 0 {
+				stateLabel := "exhausted quota"
+				if !allZero {
+					stateLabel = "low quota"
+				}
+				poolNoun := "pool"
+				if len(depletedPools) > 1 {
+					poolNoun = "pools"
+				}
+				suggestPool := readyPools[0]
+				return fmt.Sprintf("Note: %s has %s in %s %s (target_pool=all); plain 'multi-anti run' will switch to %s. Run 'multi-anti run --account %s', pass '--pool %s', or set 'multi-anti policy --pool %s'.",
+					switchedKey, stateLabel, poolNoun, strings.Join(depletedPools, ", "), fallbackKey, switchedKey, suggestPool, suggestPool)
+			}
+		}
+	}
+	if skipReason == "" {
+		skipReason = "ineligible"
+	}
+	return fmt.Sprintf("Note: %s is ineligible for automatic selection (%s); plain 'multi-anti run' will switch to %s. Run 'multi-anti run --account %s' to launch this account.",
+		switchedKey, skipReason, fallbackKey, switchedKey)
 }
 
 func readNativeTokenSummary(paths platform.Paths) nativeTokenSummary {
@@ -1503,17 +1572,19 @@ func readNativeTokenSummary(paths platform.Paths) nativeTokenSummary {
 }
 
 type runCLIFlags struct {
-	account      string
-	model        string
-	pool         domain.QuotaPool
-	hasPool      bool
-	isolate      bool
-	noRefresh    bool
-	autoRelaunch bool
-	maxSwitches  int
-	agyBin       string
-	showHelp     bool
-	agyArgs      []string
+	account        string
+	model          string
+	pool           domain.QuotaPool
+	hasPool        bool
+	isolate        bool
+	noRefresh      bool
+	autoRelaunch   bool
+	maxSwitches    int
+	hasMaxSwitches bool
+	agyBin         string
+	showHelp       bool
+	agyArgs        []string
+	barePreArgs    []string
 }
 
 func (a *App) cmdRun(ctx context.Context, args []string) int {
@@ -1531,12 +1602,22 @@ func (a *App) cmdRun(ctx context.Context, args []string) int {
 		return a.fail(err)
 	}
 
+	loadedState, loadErr := st.Load(ctx)
+	haveState := loadErr == nil
+	if strings.TrimSpace(parsed.account) == "" && len(parsed.barePreArgs) > 0 {
+		first := parsed.barePreArgs[0]
+		if isMistakenAccountPositional(first, loadedState, haveState) {
+			return a.usageFail(fmt.Sprintf("unexpected argument %q; use 'multi-anti run --account %s' to select an account (or '--' to pass arguments to agy)", first, first))
+		}
+	}
+	if !parsed.hasMaxSwitches && haveState && len(loadedState.Accounts) > parsed.maxSwitches {
+		parsed.maxSwitches = len(loadedState.Accounts)
+	}
+
 	accountKey := domain.AccountKey(strings.TrimSpace(parsed.account))
-	if accountKey != "" {
-		if state, loadErr := st.Load(ctx); loadErr == nil {
-			if resolved, resErr := resolveAccountKey(state, parsed.account); resErr == nil {
-				accountKey = resolved
-			}
+	if accountKey != "" && haveState {
+		if resolved, resErr := resolveAccountKey(loadedState, parsed.account); resErr == nil {
+			accountKey = resolved
 		}
 	}
 
@@ -1577,7 +1658,8 @@ func (a *App) cmdRun(ctx context.Context, args []string) int {
 
 func parseRunArgs(args []string) (runCLIFlags, error) {
 	out := runCLIFlags{
-		maxSwitches: defaultMaxSwitches,
+		autoRelaunch: true,
+		maxSwitches:  defaultMaxSwitches,
 	}
 
 	splitIdx := slices.Index(args, "--")
@@ -1588,8 +1670,11 @@ func parseRunArgs(args []string) (runCLIFlags, error) {
 		post = args[splitIdx+1:]
 	}
 
+	prevWasAgyValueFlag := false
 	for i := 0; i < len(pre); i++ {
 		arg := pre[i]
+		wasValue := prevWasAgyValueFlag
+		prevWasAgyValueFlag = false
 		switch {
 		case arg == "-h" || arg == "--help":
 			out.showHelp = true
@@ -1618,6 +1703,14 @@ func parseRunArgs(args []string) (runCLIFlags, error) {
 				return out, err
 			}
 			out.autoRelaunch = v
+		case arg == "--no-auto-relaunch":
+			out.autoRelaunch = false
+		case strings.HasPrefix(arg, "--no-auto-relaunch="):
+			v, err := parseBoolFlagValue("--no-auto-relaunch", strings.TrimPrefix(arg, "--no-auto-relaunch="))
+			if err != nil {
+				return out, err
+			}
+			out.autoRelaunch = !v
 		case arg == "--account":
 			if i+1 >= len(pre) {
 				return out, errors.New("--account requires a value")
@@ -1644,12 +1737,14 @@ func parseRunArgs(args []string) (runCLIFlags, error) {
 				return out, err
 			}
 			out.maxSwitches = n
+			out.hasMaxSwitches = true
 		case strings.HasPrefix(arg, "--max-switches="):
 			n, err := parseNonNegInt("--max-switches", strings.TrimPrefix(arg, "--max-switches="))
 			if err != nil {
 				return out, err
 			}
 			out.maxSwitches = n
+			out.hasMaxSwitches = true
 		case arg == "--pool":
 			if i+1 >= len(pre) {
 				return out, errors.New("--pool requires a value")
@@ -1680,6 +1775,13 @@ func parseRunArgs(args []string) (runCLIFlags, error) {
 			out.agyArgs = append(out.agyArgs, arg)
 		default:
 			out.agyArgs = append(out.agyArgs, arg)
+			if !wasValue {
+				if isAgyValueFlag(arg) {
+					prevWasAgyValueFlag = true
+				} else if !strings.HasPrefix(arg, "-") {
+					out.barePreArgs = append(out.barePreArgs, arg)
+				}
+			}
 		}
 	}
 
@@ -1688,6 +1790,58 @@ func parseRunArgs(args []string) (runCLIFlags, error) {
 		out.model = peekModelFlag(post)
 	}
 	return out, nil
+}
+
+func isMistakenAccountPositional(arg string, state domain.StoreState, haveState bool) bool {
+	if isKnownAgySubcommand(arg) {
+		return false
+	}
+	if looksLikeEmail(arg) {
+		return true
+	}
+	if !haveState {
+		return false
+	}
+	_, err := resolveAccountKey(state, arg)
+	return err == nil
+}
+
+func isAgyValueFlag(arg string) bool {
+	switch arg {
+	case "-p", "--print", "--prompt", "--print-timeout",
+		"-i", "--prompt-interactive",
+		"-r", "--resume", "--conversation",
+		"--add-dir", "--agent", "--effort",
+		"--input-format", "--json-schema", "--log-file",
+		"--mode", "--output-format", "--project", "--settings":
+		return true
+	default:
+		return false
+	}
+}
+
+func isKnownAgySubcommand(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "acp", "agent", "agents", "changelog", "help", "install",
+		"mcp", "mic-serve", "models", "plugin", "plugins",
+		"remote-control", "update", "chat", "auth", "login",
+		"logout", "version", "completion", "doctor", "config":
+		return true
+	default:
+		return false
+	}
+}
+
+func looksLikeEmail(s string) bool {
+	local, dom, ok := strings.Cut(s, "@")
+	if !ok || local == "" || dom == "" || strings.Contains(dom, "@") {
+		return false
+	}
+	if strings.ContainsAny(s, " \t\r\n/\\") {
+		return false
+	}
+	dot := strings.IndexByte(dom, '.')
+	return dot > 0 && dot < len(dom)-1
 }
 
 func peekModelFlag(args []string) string {
@@ -2216,7 +2370,7 @@ func (a *App) cmdDoctor(ctx context.Context, args []string) int {
 		report.Checks = append(report.Checks, checkPluginInstall(ctx, agyPath, pluginStatus)...)
 		report.Checks = append(report.Checks, checkStatusLineSetting(pluginStatus))
 	}
-	report.Checks = append(report.Checks, checkSSHTTYEnv())
+	report.Checks = append(report.Checks, checkSSHTTYEnv(a.goos))
 	report.Checks = append(report.Checks, checkOAuthClientConfig())
 
 	for _, c := range report.Checks {
@@ -2495,7 +2649,7 @@ func checkStatusLineSetting(st hook.PluginStatus) DoctorCheckView {
 	}
 }
 
-func checkSSHTTYEnv() DoctorCheckView {
+func checkSSHTTYEnv(goos string) DoctorCheckView {
 	if v := strings.TrimSpace(os.Getenv("SSH_TTY")); v != "" {
 		return DoctorCheckView{
 			Name:    "file_auth_env",
@@ -2507,7 +2661,7 @@ func checkSSHTTYEnv() DoctorCheckView {
 	return DoctorCheckView{
 		Name:    "file_auth_env",
 		Status:  DoctorInfo,
-		Summary: "SSH_TTY is unset; use 'multi-anti run' or export SSH_TTY=multi-anti for direct agy",
+		Summary: fmt.Sprintf("SSH_TTY is unset; use 'multi-anti run' or %s for direct agy", sshTTYSetHint(goos)),
 	}
 }
 
@@ -2617,17 +2771,17 @@ func parseTargetPoolFlag(raw string, allowAll bool) (domain.QuotaPool, error) {
 		if allowAll {
 			return "", nil
 		}
-		return "", errors.New("invalid --pool \"all\" (expected gemini, 3p, or gemini-argon)")
+		return "", errors.New("invalid --pool \"all\" (expected gemini or 3p)")
 	}
 	p := domain.QuotaPool(trimmed)
 	switch p {
-	case domain.PoolGemini, domain.Pool3P, domain.PoolGeminiArgon:
+	case domain.PoolGemini, domain.Pool3P:
 		return p, nil
 	default:
 		if allowAll {
-			return "", fmt.Errorf("invalid --pool %q (expected gemini, 3p, gemini-argon, or all)", raw)
+			return "", fmt.Errorf("invalid --pool %q (expected gemini, 3p, or all)", raw)
 		}
-		return "", fmt.Errorf("invalid --pool %q (expected gemini, 3p, or gemini-argon)", raw)
+		return "", fmt.Errorf("invalid --pool %q (expected gemini or 3p)", raw)
 	}
 }
 
@@ -2818,11 +2972,11 @@ func (a *App) printSubcommandHelp(cmd string, w io.Writer) bool {
 	case "accounts", "list", "ls":
 		text = "Usage: multi-anti accounts [--json]\nAliases: list, ls\n"
 	case "quota", "usage", "status":
-		text = "Usage: multi-anti quota [--no-refresh|--cached] [--refresh] [--watch[=30s]] [--models] [--pool <gemini|3p|gemini-argon>] [--json]\nAliases: usage, status\n"
+		text = "Usage: multi-anti quota [--no-refresh|--cached] [--refresh] [--watch[=30s]] [--models] [--pool <gemini|3p|all>] [--json]\nAliases: usage, status\n"
 	case "switch":
-		text = "Usage: multi-anti switch [email-or-key] [--model <m>] [--pool <gemini|3p|gemini-argon>] [--no-refresh] [--force] [--json]\n"
+		text = "Usage: multi-anti switch [email-or-key] [--model <m>] [--pool <gemini|3p|all>] [--no-refresh] [--force] [--json]\n"
 	case "next":
-		text = "Usage: multi-anti next [--model <m>] [--pool <gemini|3p|gemini-argon>] [--no-refresh] [--json]\n"
+		text = "Usage: multi-anti next [--model <m>] [--pool <gemini|3p|all>] [--no-refresh] [--json]\n"
 	case "run", "agy":
 		text = `Usage: multi-anti run [multi-anti flags] [agy args...] [-- <agy args...>]
 Aliases: agy
@@ -2830,15 +2984,16 @@ Aliases: agy
 multi-anti flags (before '--'):
   --account <email-or-key>           Explicitly select an account
   --model <model>                    Select account pool for model AND forward --model to agy
-  --pool <gemini|3p|gemini-argon>    Override target quota pool for selection
+  --pool <gemini|3p>                 Override target quota pool for selection
   --isolate                          Run agy in a per-account HOME directory
   --no-refresh                       Skip pre-launch quota refresh
-  --auto-relaunch                    Relaunch interactive agy on Stop hook switch signal
-  --max-switches <N>                 Max auto-switch retries (default 3)
+  --auto-relaunch                    Relaunch and continue interactive agy on Stop switch signal (default true)
+  --no-auto-relaunch                 Disable automatic interactive relaunch on quota switch
+  --max-switches <N>                 Max auto-switch retries (default max(3, accounts))
   --agy-bin <path>                   Override agy executable path
 `
 	case "policy":
-		text = "Usage: multi-anti policy [--mode highest_remaining|fill_first|round_robin|priority] [--threshold <0..1>] [--cooldown <dur>] [--refresh-skew <dur>] [--pool <gemini|3p|gemini-argon|all>] [--json]\n"
+		text = "Usage: multi-anti policy [--mode highest_remaining|fill_first|round_robin|priority] [--threshold <0..1>] [--cooldown <dur>] [--refresh-skew <dur>] [--pool <gemini|3p|all>] [--json]\n"
 	case "enable":
 		text = "Usage: multi-anti enable <email-or-key>\n"
 	case "disable":

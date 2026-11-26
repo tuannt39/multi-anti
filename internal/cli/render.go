@@ -223,7 +223,7 @@ func buildHealthView(h domain.AccountHealth, now time.Time) HealthView {
 	return view
 }
 
-func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterPool domain.QuotaPool) *QuotaSnapshotView {
+func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterPool domain.QuotaPool, now time.Time) *QuotaSnapshotView {
 	if q == nil {
 		return nil
 	}
@@ -240,14 +240,15 @@ func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterP
 		if filterPool != "" && b.Pool != filterPool {
 			continue
 		}
+		rem, resetAt := b.EffectiveAt(now)
 		view.Buckets = append(view.Buckets, QuotaBucketView{
 			GroupID:           b.GroupID,
 			DisplayName:       b.DisplayName,
 			Pool:              b.Pool,
 			Window:            b.Window,
-			RemainingFraction: clampFraction(b.RemainingFraction),
-			RemainingPercent:  roundPercent(b.RemainingFraction),
-			ResetAt:           copyTimePtr(b.ResetAt),
+			RemainingFraction: clampFraction(rem),
+			RemainingPercent:  roundPercent(rem),
+			ResetAt:           copyTimePtr(resetAt),
 		})
 	}
 	if includeModels || len(q.Buckets) == 0 {
@@ -259,13 +260,14 @@ func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterP
 			if filterPool != "" && pool != filterPool {
 				continue
 			}
+			rem, resetAt := m.EffectiveAt(now)
 			view.Models = append(view.Models, ModelQuotaView{
 				ModelID:           m.ModelID,
 				DisplayName:       m.DisplayName,
 				Pool:              pool,
-				RemainingFraction: clampFraction(m.RemainingFraction),
-				RemainingPercent:  roundPercent(m.RemainingFraction),
-				ResetAt:           copyTimePtr(m.ResetAt),
+				RemainingFraction: clampFraction(rem),
+				RemainingPercent:  roundPercent(rem),
+				ResetAt:           copyTimePtr(resetAt),
 				SupportsThinking:  m.SupportsThinking,
 			})
 		}
@@ -281,13 +283,13 @@ func buildAccountView(acc domain.Account, activeKey domain.AccountKey, pool doma
 
 	if acc.Quota != nil {
 		tier = acc.Quota.Tier
-		if rem, resetAt, ok := acc.Quota.PoolRemaining(pool); ok {
+		if rem, resetAt, ok := acc.Quota.PoolRemainingAt(pool, now); ok {
 			clamped := clampFraction(rem)
 			remPtr = &clamped
 			resetPtr = copyTimePtr(resetAt)
 		}
 		if includeQuota {
-			qView = buildQuotaSnapshotView(acc.Quota, false, pool)
+			qView = buildQuotaSnapshotView(acc.Quota, false, pool, now)
 		}
 	}
 
@@ -362,7 +364,7 @@ func buildQuotaReportView(
 		var pctPtr *int
 		hasData := acc.Quota != nil && (len(acc.Quota.Buckets) > 0 || len(acc.Quota.Models) > 0)
 		if hasData {
-			if rem, resetAt, ok := acc.Quota.PoolRemaining(targetPool); ok {
+			if rem, resetAt, ok := acc.Quota.PoolRemainingAt(targetPool, now); ok {
 				clamped := clampFraction(rem)
 				pct := roundPercent(clamped)
 				remPtr = &clamped
@@ -389,7 +391,7 @@ func buildQuotaReportView(
 			ResetAt:          copyTimePtr(c.ResetAt),
 			RefreshedAuth:    refreshedAuth,
 			Error:            fetchErr,
-			Quota:            buildQuotaSnapshotView(acc.Quota, includeModels, targetPool),
+			Quota:            buildQuotaSnapshotView(acc.Quota, includeModels, targetPool, now),
 		})
 	}
 	return report
@@ -412,7 +414,7 @@ func renderAccountsTable(w io.Writer, state domain.StoreState, native nativeToke
 
 	keys := sortedAccountKeys(state.Accounts)
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "ACT\tACCOUNT\tTIER\tHEALTH\tPRIO\tGEMINI 5h/wk\tCLAUDE/GPT 5h/wk\tARGON wk\tLAST USED")
+	fmt.Fprintln(tw, "ACT\tACCOUNT\tTIER\tHEALTH\tPRIO\tGEMINI 5h/wk\tCLAUDE/GPT 5h/wk\tLAST USED")
 	for _, k := range keys {
 		acc := state.Accounts[k]
 		act := ""
@@ -424,9 +426,8 @@ func renderAccountsTable(w io.Writer, state domain.StoreState, native nativeToke
 		health := formatHealthLabel(acc.Health, now)
 		gemCell := hook.FormatDualWindowCell(acc.Quota, domain.PoolGemini, now)
 		cpCell := hook.FormatDualWindowCell(acc.Quota, domain.Pool3P, now)
-		argCell := hook.FormatSingleOrDualWindowCell(acc.Quota, domain.PoolGeminiArgon, now)
 		lastUsed := formatTimeRelative(acc.LastUsedAt, now)
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", act, label, tier, health, acc.Priority, gemCell, cpCell, argCell, lastUsed)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", act, label, tier, health, acc.Priority, gemCell, cpCell, lastUsed)
 	}
 	_ = tw.Flush()
 
@@ -527,7 +528,6 @@ type quotaPoolLabel struct {
 var quotaPoolLabels = []quotaPoolLabel{
 	{Pool: domain.PoolGemini, Label: "gemini"},
 	{Pool: domain.Pool3P, Label: "claude/gpt"},
-	{Pool: domain.PoolGeminiArgon, Label: "argon"},
 	{Pool: domain.PoolOther, Label: "other"},
 }
 

@@ -263,3 +263,73 @@ func TestNativeBackupAndRestore(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadNormalizesLegacyGeminiArgonState(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	legacyJSON := `{
+  "schema_version": 1,
+  "generation": 4,
+  "active_key": "alice@example.com",
+  "policy": {
+    "mode": "highest_remaining",
+    "target_pool": "gemini-argon",
+    "min_remaining_threshold": 0.05,
+    "cooldown_default": 300000000000,
+    "refresh_skew": 300000000000
+  },
+  "accounts": {
+    "alice@example.com": {
+      "key": "alice@example.com",
+      "email": "alice@example.com",
+      "health": {"status": "ready", "updated_at": "2026-11-25T12:00:00Z"},
+      "creds": {"access_token": "at-a", "refresh_token": "rt-a"},
+      "quota": {
+        "fetched_at": "2026-11-21T17:00:00Z",
+        "source": "retrieveUserQuotaSummary",
+        "tier": "pro",
+        "buckets": [
+          {"group_id": "gemini-5h", "pool": "gemini", "window": "5h", "remaining_fraction": 0.80},
+          {"group_id": "gemini-weekly", "pool": "gemini", "window": "weekly", "remaining_fraction": 0.90},
+          {"group_id": "3p-5h", "pool": "3p", "window": "5h", "remaining_fraction": 1.0},
+          {"group_id": "3p-weekly", "pool": "3p", "window": "weekly", "remaining_fraction": 1.0},
+          {"group_id": "gemini-argon-wtu-weekly", "pool": "gemini-argon", "window": "weekly", "remaining_fraction": 1.0}
+        ]
+      }
+    }
+  },
+  "last_switch": {
+    "at": "2026-11-21T17:00:00Z",
+    "outcome": "switched",
+    "from_key": "bob@example.com",
+    "to_key": "alice@example.com",
+    "reason": "quota_low",
+    "pool": "gemini-argon",
+    "trigger": "cli"
+  }
+}`
+	if err := platform.WriteFileAtomic(s.Paths().StateFile(), []byte(legacyJSON), true); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.Policy.TargetPool != domain.PoolGemini {
+		t.Fatalf("Policy.TargetPool = %q, want %q", got.Policy.TargetPool, domain.PoolGemini)
+	}
+	if got.LastSwitch == nil || got.LastSwitch.Pool != domain.PoolGemini {
+		t.Fatalf("LastSwitch.Pool = %+v, want %q", got.LastSwitch, domain.PoolGemini)
+	}
+	buckets := got.Accounts["alice@example.com"].Quota.Buckets
+	if len(buckets) != 4 {
+		t.Fatalf("len(Buckets) = %d, want 4 after stripping gemini-argon: %+v", len(buckets), buckets)
+	}
+	for _, b := range buckets {
+		if b.Pool == "gemini-argon" || b.GroupID == "gemini-argon-wtu-weekly" {
+			t.Fatalf("legacy gemini-argon bucket survived Load(): %+v", b)
+		}
+	}
+}

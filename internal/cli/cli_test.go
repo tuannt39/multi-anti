@@ -84,6 +84,9 @@ func setupCLIEnv(t *testing.T) (platform.Paths, *store.FileStore) {
 	t.Setenv("MULTI_ANTI_AGY_HOME", filepath.Join(tmp, "agy-home"))
 	t.Setenv("MULTI_ANTI_ACCOUNT", "")
 	t.Setenv("MULTI_ANTI_ISOLATED", "")
+	t.Setenv("MULTI_ANTI_MANAGED", "")
+	t.Setenv("MULTI_ANTI_RUN_ID", "")
+	t.Setenv("SSH_TTY", "")
 
 	paths, err := platform.ResolvePaths()
 	if err != nil {
@@ -272,9 +275,13 @@ func main() {
 		_ = f.Close()
 	}
 
-	if failAcct := os.Getenv("FAKE_AGY_FAIL_ACCOUNT"); failAcct != "" && acct == failAcct {
-		fmt.Fprintln(os.Stderr, "HTTP 429 RESOURCE_EXHAUSTED: retryDelay: \"30s\"")
-		os.Exit(1)
+	if failAcct := os.Getenv("FAKE_AGY_FAIL_ACCOUNT"); failAcct != "" {
+		for _, candidate := range strings.Split(failAcct, ",") {
+			if strings.TrimSpace(candidate) == acct {
+				fmt.Fprintln(os.Stderr, "HTTP 429 RESOURCE_EXHAUSTED: retryDelay: \"30s\"")
+				os.Exit(1)
+			}
+		}
 	}
 	if codeStr := os.Getenv("FAKE_AGY_EXIT_CODE"); codeStr != "" {
 		if code, err := strconv.Atoi(codeStr); err == nil && code != 0 {
@@ -1589,7 +1596,6 @@ func TestUsageAliasAndFullModelsAndQuotaDisplay(t *testing.T) {
 				{GroupID: "gemini-weekly", DisplayName: "Weekly Limit Remaining", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.8181, ResetAt: &gemWeeklyReset},
 				{GroupID: "3p-5h", DisplayName: "Five Hour Limit Remaining", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 1.00},
 				{GroupID: "3p-weekly", DisplayName: "Weekly Limit Remaining", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0.3591, ResetAt: &threePWeeklyReset},
-				{GroupID: "gemini-argon-weekly", DisplayName: "Gemini 4 Argon Weekly Limit", Pool: domain.PoolGeminiArgon, Window: domain.WindowWeekly, RemainingFraction: 1.00},
 			},
 		},
 		AddedAt: now.Add(-24 * time.Hour),
@@ -1621,12 +1627,10 @@ func TestUsageAliasAndFullModelsAndQuotaDisplay(t *testing.T) {
 		"elobuddyvietnam@gmail.com (pro) [*]",
 		"gemini",
 		"claude/gpt",
-		"argon",
 		"5h [#########.]  87.33% 4h 47m",
 		"wk [########..]  81.81% 141h 59m",
 		"5h [##########] 100.00% -",
 		"wk [####......]  35.91% 158h 13m",
-		"wk [##########] 100.00% -",
 	}
 	for _, want := range wantCompact {
 		if !strings.Contains(out, want) {
@@ -1637,9 +1641,10 @@ func TestUsageAliasAndFullModelsAndQuotaDisplay(t *testing.T) {
 		"Models within this group:",
 		"For paid Pro plans",
 		"│Within each group",
+		"argon",
 	} {
-		if strings.Contains(out, unwanted) {
-			t.Fatalf("usage --cached output unexpectedly included verbose boilerplate %q:\n%s", unwanted, out)
+		if strings.Contains(strings.ToLower(out), strings.ToLower(unwanted)) {
+			t.Fatalf("usage --cached output unexpectedly included %q:\n%s", unwanted, out)
 		}
 	}
 
@@ -1652,7 +1657,7 @@ func TestUsageAliasAndFullModelsAndQuotaDisplay(t *testing.T) {
 	if !strings.Contains(poolOut, "gemini") || !strings.Contains(poolOut, "87.33%") {
 		t.Fatalf("expected gemini compact breakdown in filtered output:\n%s", poolOut)
 	}
-	if strings.Contains(poolOut, "claude/gpt") || strings.Contains(poolOut, "argon") {
+	if strings.Contains(poolOut, "claude/gpt") {
 		t.Fatalf("unexpected other pool rows in --pool gemini output:\n%s", poolOut)
 	}
 
@@ -1734,7 +1739,6 @@ func TestAccountsColumnsNativeSyncAndSwitchHints(t *testing.T) {
 				{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.90},
 				{GroupID: "gemini-weekly", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.98},
 				{GroupID: "3p-weekly", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0.50},
-				{GroupID: "gemini-argon-wtu-weekly", Pool: domain.PoolGeminiArgon, Window: domain.WindowWeekly, RemainingFraction: 1.00},
 			},
 		},
 		AddedAt: now.Add(-24 * time.Hour),
@@ -1749,7 +1753,6 @@ func TestAccountsColumnsNativeSyncAndSwitchHints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Native token holds fresher alice credentials.
 	fresherAliceRaw, err := oauth.EncodeAgyTokenFile(alice.Email, domain.AccountCredentials{
 		AccessToken:  "native-fresher-alice",
 		RefreshToken: "rt-alice",
@@ -1776,17 +1779,19 @@ func TestAccountsColumnsNativeSyncAndSwitchHints(t *testing.T) {
 		t.Fatalf("accounts failed code=%d stderr=%s", code, stderr.String())
 	}
 	accOut := stdout.String()
-	for _, want := range []string{"GEMINI 5h/wk", "CLAUDE/GPT 5h/wk", "ARGON wk", "90%/98%", "-/50%", "100%"} {
+	for _, want := range []string{"GEMINI 5h/wk", "CLAUDE/GPT 5h/wk", "90%/98%", "-/50%"} {
 		if !strings.Contains(accOut, want) {
 			t.Fatalf("accounts output missing %q:\n%s", want, accOut)
 		}
+	}
+	if strings.Contains(accOut, "ARGON") {
+		t.Fatalf("accounts output unexpectedly contained ARGON:\n%s", accOut)
 	}
 	stateAfterSync, _ := st.Load(ctx)
 	if stateAfterSync.Accounts[alice.Key].Creds.AccessToken != "native-fresher-alice" {
 		t.Fatalf("accounts did not sync fresher native token: %+v", stateAfterSync.Accounts[alice.Key].Creds)
 	}
 
-	// Unmanaged account in native token produces unmanaged note without modifying store.
 	unmanagedRaw, err := oauth.EncodeAgyTokenFile("stranger@example.com", domain.AccountCredentials{
 		AccessToken:  "at-stranger",
 		RefreshToken: "rt-stranger",
@@ -1806,7 +1811,6 @@ func TestAccountsColumnsNativeSyncAndSwitchHints(t *testing.T) {
 		t.Fatalf("expected unmanaged native token note, got:\n%s", stdout.String())
 	}
 
-	// Managed mismatch note when native token holds bob while active_key is alice.
 	bobNativeRaw, _ := oauth.EncodeAgyTokenFile(bob.Email, domain.AccountCredentials{
 		AccessToken:  "at-bob",
 		RefreshToken: "rt-bob",
@@ -1823,7 +1827,6 @@ func TestAccountsColumnsNativeSyncAndSwitchHints(t *testing.T) {
 		t.Fatalf("expected drift note, got:\n%s", stdout.String())
 	}
 
-	// Switch away from alice after restoring fresher alice token to native path; must save fresher token AND emit hints.
 	fresherAliceRaw2, _ := oauth.EncodeAgyTokenFile(alice.Email, domain.AccountCredentials{
 		AccessToken:  "native-fresher-alice-2",
 		RefreshToken: "rt-alice",
@@ -1849,7 +1852,6 @@ func TestAccountsColumnsNativeSyncAndSwitchHints(t *testing.T) {
 		t.Fatalf("next overwrote native token without saving fresher alice token: %+v", stateAfterNext.Accounts[alice.Key].Creds)
 	}
 
-	// Ensure --json output stays strictly valid JSON without trailing human notes.
 	stdout.Reset()
 	stderr.Reset()
 	if code := Run(ctx, []string{"switch", "alice@example.com", "--json"}, cfg); code != 0 {
@@ -2034,6 +2036,707 @@ func TestRemoveClearsMatchingStagedNativeToken(t *testing.T) {
 			t.Fatalf("remove bob when native token absent failed code=%d stderr=%s", code, stderr.String())
 		}
 	})
+}
+
+func TestRunPositionalAccountGuardSwitchPoolHintsAndWindowsSSHTTY(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 25, 16, 0, 0, 0, time.UTC)
+
+	newReproAccounts := func() (domain.Account, domain.Account) {
+		reset3P := now.Add(14*time.Hour + 9*time.Minute)
+		dijen := domain.Account{
+			Key:         "dijendergupta5@gmail.com",
+			Email:       "dijendergupta5@gmail.com",
+			DisplayName: "dijen",
+			Health:      domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now},
+			Creds: domain.AccountCredentials{
+				AccessToken:  "at-dijen",
+				RefreshToken: "rt-dijen",
+				Expiry:       now.Add(time.Hour),
+			},
+			Quota: &domain.QuotaSnapshot{
+				FetchedAt: now,
+				Source:    domain.QuotaSourceSummary,
+				Tier:      domain.TierPro,
+				Buckets: []domain.QuotaBucket{
+					{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 1.0},
+					{GroupID: "gemini-wk", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 1.0},
+					{GroupID: "3p-wk", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0.0, ResetAt: &reset3P},
+				},
+			},
+			AddedAt: now.Add(-24 * time.Hour),
+		}
+		sanj := domain.Account{
+			Key:    "sanjeesanya4@gmail.com",
+			Email:  "sanjeesanya4@gmail.com",
+			Health: domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now},
+			Creds: domain.AccountCredentials{
+				AccessToken:  "at-sanj",
+				RefreshToken: "rt-sanj",
+				Expiry:       now.Add(time.Hour),
+			},
+			Quota: &domain.QuotaSnapshot{
+				FetchedAt: now,
+				Source:    domain.QuotaSourceSummary,
+				Tier:      domain.TierPro,
+				Buckets: []domain.QuotaBucket{
+					{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 1.0},
+					{GroupID: "gemini-wk", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 1.0},
+					{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 1.0},
+					{GroupID: "3p-wk", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0.49},
+				},
+			},
+			AddedAt: now.Add(-24 * time.Hour),
+		}
+		return dijen, sanj
+	}
+
+	t.Run("run_rejects_bare_email_or_account_before_dashdash_without_side_effects", func(t *testing.T) {
+		paths, st := setupCLIEnv(t)
+		fakeAgy := buildFakeAgyBinary(t)
+		dijen, sanj := newReproAccounts()
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.Accounts[dijen.Key] = dijen
+			s.Accounts[sanj.Key] = sanj
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		logPath := filepath.Join(t.TempDir(), "agy.log")
+		t.Setenv("FAKE_AGY_LOG", logPath)
+
+		var fetchCalls atomic.Int32
+		var stdout, stderr bytes.Buffer
+		cfg := Config{
+			AgyBinary: fakeAgy,
+			Store:     st,
+			OAuth:     &stubOAuth{},
+			Fetcher: &stubFetcher{
+				fetchFn: func(ctx context.Context, accessToken string, opts quota.FetchOptions) (domain.QuotaSnapshot, error) {
+					fetchCalls.Add(1)
+					return domain.QuotaSnapshot{}, nil
+				},
+			},
+			Stdin:  strings.NewReader(""),
+			Stdout: &stdout,
+			Stderr: &stderr,
+			Now:    func() time.Time { return now },
+		}
+
+		rejectedCases := []struct {
+			args     []string
+			wantHint string
+		}{
+			{
+				args:     []string{"run", "dijendergupta5@gmail.com"},
+				wantHint: "use 'multi-anti run --account dijendergupta5@gmail.com'",
+			},
+			{
+				args:     []string{"run", "dijen"},
+				wantHint: "use 'multi-anti run --account dijen'",
+			},
+			{
+				args:     []string{"run", "typo@gmail.com"},
+				wantHint: "use 'multi-anti run --account typo@gmail.com'",
+			},
+			{
+				args:     []string{"run", "-c", "dijendergupta5@gmail.com"},
+				wantHint: "use 'multi-anti run --account dijendergupta5@gmail.com'",
+			},
+		}
+
+		for _, tc := range rejectedCases {
+			stdout.Reset()
+			stderr.Reset()
+			code := Run(ctx, tc.args, cfg)
+			if code != 2 {
+				t.Fatalf("Run(%v) exit code = %d, want 2 (stderr=%q)", tc.args, code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantHint) {
+				t.Fatalf("Run(%v) stderr = %q, want substring %q", tc.args, stderr.String(), tc.wantHint)
+			}
+		}
+
+		if fetchCalls.Load() != 0 {
+			t.Fatalf("rejected run args triggered %d quota fetches, want 0", fetchCalls.Load())
+		}
+		if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+			t.Fatalf("rejected run args invoked agy (stat log err=%v)", err)
+		}
+		if _, err := os.Stat(paths.NativeAgyTokenPath()); !os.IsNotExist(err) {
+			t.Fatalf("rejected run args staged native token (stat err=%v)", err)
+		}
+		stateAfterReject, err := st.Load(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stateAfterReject.ActiveKey != "" {
+			t.Fatalf("ActiveKey mutated to %q after rejected run", stateAfterReject.ActiveKey)
+		}
+		for _, k := range []domain.AccountKey{dijen.Key, sanj.Key} {
+			if stateAfterReject.Accounts[k].LastUsedAt != nil {
+				t.Fatalf("LastUsedAt mutated for %s after rejected run", k)
+			}
+		}
+
+		validCases := []struct {
+			args        []string
+			wantLogPref string
+			wantLogArg  string
+		}{
+			{
+				args:        []string{"run", "--no-refresh", "-p", "dijendergupta5@gmail.com"},
+				wantLogPref: "sanjeesanya4@gmail.com|",
+				wantLogArg:  "-p dijendergupta5@gmail.com",
+			},
+			{
+				args:        []string{"run", "--no-refresh", "--", "-p", "dijendergupta5@gmail.com"},
+				wantLogPref: "sanjeesanya4@gmail.com|",
+				wantLogArg:  "-p dijendergupta5@gmail.com",
+			},
+			{
+				args:        []string{"run", "--no-refresh", "--account", "dijendergupta5@gmail.com", "-p", "hi"},
+				wantLogPref: "dijendergupta5@gmail.com|",
+				wantLogArg:  "-p hi",
+			},
+		}
+
+		for _, tc := range validCases {
+			_ = os.Remove(logPath)
+			stdout.Reset()
+			stderr.Reset()
+			code := Run(ctx, tc.args, cfg)
+			if code != 0 {
+				t.Fatalf("Run(%v) code = %d, want 0 (stderr=%q)", tc.args, code, stderr.String())
+			}
+			raw, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("Run(%v) read agy log: %v", tc.args, err)
+			}
+			line := strings.TrimSpace(string(raw))
+			if !strings.HasPrefix(line, tc.wantLogPref) || !strings.Contains(line, tc.wantLogArg) {
+				t.Fatalf("Run(%v) log = %q, want prefix %q and arg %q", tc.args, line, tc.wantLogPref, tc.wantLogArg)
+			}
+		}
+	})
+
+	t.Run("switch_and_next_emit_truthful_pool_exhaustion_hints", func(t *testing.T) {
+		_, st := setupCLIEnv(t)
+		dijen, sanj := newReproAccounts()
+		cooldownAcc := makeAccount("cool@example.com", 0.90, 0.90, "at-cool", "rt-cool", now.Add(time.Hour))
+		until := now.Add(15 * time.Minute)
+		cooldownAcc.Health = domain.AccountHealth{Status: domain.HealthCooldown, CooldownUntil: &until, Reason: "429", UpdatedAt: now}
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.Accounts[dijen.Key] = dijen
+			s.Accounts[sanj.Key] = sanj
+			s.Accounts[cooldownAcc.Key] = cooldownAcc
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		cfg := Config{
+			Store:   st,
+			OAuth:   &stubOAuth{},
+			Fetcher: &stubFetcher{},
+			Stdout:  &stdout,
+			Stderr:  &stderr,
+			Now:     func() time.Time { return now },
+		}
+
+		if code := Run(ctx, []string{"switch", "dijendergupta5@gmail.com"}, cfg); code != 0 {
+			t.Fatalf("switch dijen failed code=%d stderr=%s", code, stderr.String())
+		}
+		out := stdout.String()
+		for _, want := range []string{
+			"dijendergupta5@gmail.com has exhausted quota in pool 3p (target_pool=all)",
+			"plain 'multi-anti run' will switch to sanjeesanya4@gmail.com",
+			"multi-anti run --account dijendergupta5@gmail.com",
+			"--pool gemini",
+			"multi-anti policy --pool gemini",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("switch dijen output missing %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "fill_first") {
+			t.Fatalf("switch dijen output unexpectedly suggested fill_first:\n%s", out)
+		}
+
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.Policy.Mode = domain.SwitchFillFirst
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(ctx, []string{"switch", "dijendergupta5@gmail.com"}, cfg); code != 0 {
+			t.Fatalf("switch dijen under fill_first failed code=%d stderr=%s", code, stderr.String())
+		}
+		fillOut := stdout.String()
+		if !strings.Contains(fillOut, "dijendergupta5@gmail.com has exhausted quota in pool 3p (target_pool=all)") {
+			t.Fatalf("switch dijen under fill_first missing pool exhaustion hint:\n%s", fillOut)
+		}
+		if strings.Contains(fillOut, "fill_first") {
+			t.Fatalf("switch dijen under fill_first unexpectedly contained fill_first:\n%s", fillOut)
+		}
+
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.Policy.Mode = domain.SwitchHighestRemaining
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(ctx, []string{"switch", "cool@example.com", "--force"}, cfg); code != 0 {
+			t.Fatalf("switch cooldown --force failed code=%d stderr=%s", code, stderr.String())
+		}
+		coolOut := stdout.String()
+		if !strings.Contains(coolOut, "ineligible for automatic selection (health_cooldown)") ||
+			!strings.Contains(coolOut, "multi-anti run --account cool@example.com") {
+			t.Fatalf("switch cooldown --force missing expected hint:\n%s", coolOut)
+		}
+		if strings.Contains(coolOut, "fill_first") {
+			t.Fatalf("switch cooldown --force unexpectedly suggested fill_first:\n%s", coolOut)
+		}
+
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(ctx, []string{"next", "--no-refresh"}, cfg); code != 0 {
+			t.Fatalf("next failed code=%d stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Switched active account to sanjeesanya4@gmail.com") {
+			t.Fatalf("expected next to switch to sanjeesanya4@gmail.com, got:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("windows_and_linux_ssh_tty_hints_in_switch_next_and_doctor", func(t *testing.T) {
+		_, st := setupCLIEnv(t)
+		fakeAgy := buildFakeAgyBinary(t)
+		alice := makeAccount("alice@example.com", 0.90, 0.90, "at-alice", "rt-alice", now.Add(time.Hour))
+		bob := makeAccount("bob@example.com", 0.80, 0.80, "at-bob", "rt-bob", now.Add(time.Hour))
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = alice.Key
+			s.Accounts[alice.Key] = alice
+			s.Accounts[bob.Key] = bob
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		cfg := Config{
+			AgyBinary: fakeAgy,
+			Store:     st,
+			OAuth:     &stubOAuth{},
+			Fetcher:   &stubFetcher{},
+			Stdout:    &stdout,
+			Stderr:    &stderr,
+			Now:       func() time.Time { return now },
+		}
+
+		winApp := NewApp(cfg)
+		winApp.goos = "windows"
+		for _, args := range [][]string{
+			{"switch", "bob@example.com"},
+			{"next", "--no-refresh"},
+			{"doctor"},
+		} {
+			stdout.Reset()
+			stderr.Reset()
+			if code := winApp.Run(ctx, args); code != 0 {
+				t.Fatalf("winApp.Run(%v) failed code=%d stderr=%s", args, code, stderr.String())
+			}
+			out := stdout.String()
+			if !strings.Contains(out, `set $env:SSH_TTY="multi-anti" in PowerShell`) {
+				t.Fatalf("winApp.Run(%v) missing PowerShell SSH_TTY hint:\n%s", args, out)
+			}
+			if strings.Contains(out, "export SSH_TTY=multi-anti") {
+				t.Fatalf("winApp.Run(%v) unexpectedly contained export SSH_TTY:\n%s", args, out)
+			}
+		}
+
+		linApp := NewApp(cfg)
+		linApp.goos = "linux"
+		for _, args := range [][]string{
+			{"switch", "bob@example.com"},
+			{"next", "--no-refresh"},
+			{"doctor"},
+		} {
+			stdout.Reset()
+			stderr.Reset()
+			if code := linApp.Run(ctx, args); code != 0 {
+				t.Fatalf("linApp.Run(%v) failed code=%d stderr=%s", args, code, stderr.String())
+			}
+			out := stdout.String()
+			if !strings.Contains(out, "export SSH_TTY=multi-anti") {
+				t.Fatalf("linApp.Run(%v) missing export SSH_TTY hint:\n%s", args, out)
+			}
+			if strings.Contains(out, "$env:SSH_TTY") {
+				t.Fatalf("linApp.Run(%v) unexpectedly contained PowerShell SSH_TTY hint:\n%s", args, out)
+			}
+		}
+	})
+}
+
+func TestRunDefaultsAutoRelaunchAndSupportsNoAutoRelaunch(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 25, 16, 40, 0, 0, time.UTC)
+
+	defaultParsed, err := parseRunArgs([]string{"--no-refresh"})
+	if err != nil {
+		t.Fatalf("parseRunArgs(--no-refresh) error = %v", err)
+	}
+	if !defaultParsed.autoRelaunch {
+		t.Fatalf("expected autoRelaunch to default to true")
+	}
+
+	disabledParsed, err := parseRunArgs([]string{"--no-auto-relaunch"})
+	if err != nil {
+		t.Fatalf("parseRunArgs(--no-auto-relaunch) error = %v", err)
+	}
+	if disabledParsed.autoRelaunch {
+		t.Fatalf("expected --no-auto-relaunch to set autoRelaunch=false")
+	}
+
+	_, st := setupCLIEnv(t)
+	fakeAgy := buildFakeAgyBinary(t)
+	if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+		for i, rem := range []float64{0.95, 0.85, 0.75, 0.65, 0.55} {
+			email := string([]byte{'a', byte('1' + i)}) + "@example.com"
+			acc := makeAccount(email, rem, rem, "at-"+email, "rt-"+email, now.Add(time.Hour))
+			s.Accounts[acc.Key] = acc
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "scale.log")
+	t.Setenv("FAKE_AGY_LOG", logPath)
+	t.Setenv("FAKE_AGY_FAIL_ACCOUNT", "a1@example.com,a2@example.com,a3@example.com,a4@example.com")
+
+	var stdout, stderr bytes.Buffer
+	cfg := Config{
+		AgyBinary: fakeAgy,
+		Store:     st,
+		OAuth:     &stubOAuth{},
+		Fetcher:   &stubFetcher{},
+		Stdin:     strings.NewReader(""),
+		Stdout:    &stdout,
+		Stderr:    &stderr,
+		Now:       func() time.Time { return now },
+	}
+
+	if code := Run(ctx, []string{"run", "--no-refresh", "-p", "hi"}, cfg); code != 0 {
+		t.Fatalf("run across 5 accounts failed code=%d stderr=%s", code, stderr.String())
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 5 || !strings.HasPrefix(lines[4], "a5@example.com|") {
+		t.Fatalf("expected failover across all 5 accounts, got lines=%v", lines)
+	}
+}
+
+func TestExpiredQuotaWindowResetsToFullAcrossStatusLineAccountsQuotaAndSelector(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 25, 17, 0, 0, 0, time.UTC)
+	_, st := setupCLIEnv(t)
+
+	epochZero := time.Unix(0, 0).UTC()
+	bkset5hReset := now.Add(4*time.Hour + 30*time.Minute)
+	bksetWkReset := now.Add(7 * 24 * time.Hour)
+	elo5hReset := now.Add(4*time.Hour + 42*time.Minute)
+	eloWkReset := now.Add(6 * 24 * time.Hour)
+	nttExpired5h := time.Date(2026, 11, 21, 18, 29, 29, 0, time.UTC)
+	nttExpired3p5h := time.Date(2026, 11, 21, 22, 1, 56, 0, time.UTC)
+	nttFutureWk := time.Date(2026, 11, 28, 13, 29, 29, 0, time.UTC)
+	nttFuture3pWk := time.Date(2026, 11, 28, 17, 1, 56, 0, time.UTC)
+
+	bkset := domain.Account{
+		Key:    "tuannt.bkset@gmail.com",
+		Email:  "tuannt.bkset@gmail.com",
+		Health: domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now},
+		Creds:  domain.AccountCredentials{AccessToken: "at-bkset", RefreshToken: "rt-bkset", Expiry: now.Add(time.Hour)},
+		Quota: &domain.QuotaSnapshot{
+			FetchedAt: now.Add(-5 * time.Minute),
+			Source:    domain.QuotaSourceSummary,
+			Tier:      domain.TierPro,
+			Buckets: []domain.QuotaBucket{
+				{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.79, ResetAt: &bkset5hReset},
+				{GroupID: "gemini-wk", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.93, ResetAt: &bksetWkReset},
+				{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 1.0, ResetAt: &epochZero},
+				{GroupID: "3p-wk", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 1.0, ResetAt: &epochZero},
+			},
+		},
+		AddedAt: now.Add(-48 * time.Hour),
+	}
+
+	elo := domain.Account{
+		Key:    "elobuddyvietnam@gmail.com",
+		Email:  "elobuddyvietnam@gmail.com",
+		Health: domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now},
+		Creds:  domain.AccountCredentials{AccessToken: "at-elo", RefreshToken: "rt-elo", Expiry: now.Add(time.Hour)},
+		Quota: &domain.QuotaSnapshot{
+			FetchedAt: now.Add(-2 * time.Minute),
+			Source:    domain.QuotaSourceSummary,
+			Tier:      domain.TierPro,
+			Buckets: []domain.QuotaBucket{
+				{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.71, ResetAt: &elo5hReset},
+				{GroupID: "gemini-wk", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.89, ResetAt: &eloWkReset},
+				{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 1.0, ResetAt: &epochZero},
+				{GroupID: "3p-wk", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 1.0, ResetAt: &epochZero},
+			},
+		},
+		AddedAt: now.Add(-48 * time.Hour),
+	}
+
+	ntt := domain.Account{
+		Key:    "ntt.cn2.01@gmail.com",
+		Email:  "ntt.cn2.01@gmail.com",
+		Health: domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now.Add(-96 * time.Hour)},
+		Creds:  domain.AccountCredentials{AccessToken: "at-ntt", RefreshToken: "rt-ntt", Expiry: now.Add(-95 * time.Hour)},
+		Quota: &domain.QuotaSnapshot{
+			FetchedAt: time.Date(2026, 11, 21, 17, 1, 55, 0, time.UTC),
+			Source:    domain.QuotaSourceSummary,
+			Tier:      domain.TierPro,
+			Buckets: []domain.QuotaBucket{
+				{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.5065, ResetAt: &nttExpired5h},
+				{GroupID: "gemini-wk", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.8590, ResetAt: &nttFutureWk},
+				{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 1.0, ResetAt: &nttExpired3p5h},
+				{GroupID: "3p-wk", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 1.0, ResetAt: &nttFuture3pWk},
+			},
+		},
+		AddedAt: now.Add(-96 * time.Hour),
+	}
+
+	epochZeroAcc := domain.Account{
+		Key:    "epoch-zero@example.com",
+		Email:  "epoch-zero@example.com",
+		Health: domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now},
+		Creds:  domain.AccountCredentials{AccessToken: "at-ez", RefreshToken: "rt-ez", Expiry: now.Add(time.Hour)},
+		Quota: &domain.QuotaSnapshot{
+			FetchedAt: now.Add(-5 * time.Minute),
+			Source:    domain.QuotaSourceSummary,
+			Tier:      domain.TierPro,
+			Buckets: []domain.QuotaBucket{
+				{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.0, ResetAt: &epochZero},
+			},
+		},
+		AddedAt: now.Add(-48 * time.Hour),
+	}
+
+	if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+		s.ActiveKey = bkset.Key
+		s.Accounts[bkset.Key] = bkset
+		s.Accounts[elo.Key] = elo
+		s.Accounts[ntt.Key] = ntt
+		s.Accounts[epochZeroAcc.Key] = epochZeroAcc
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	newCfg := func(stdin string) Config {
+		return Config{
+			Store:   st,
+			OAuth:   &stubOAuth{},
+			Fetcher: &stubFetcher{},
+			Stdin:   strings.NewReader(stdin),
+			Stdout:  &stdout,
+			Stderr:  &stderr,
+			Now:     func() time.Time { return now },
+		}
+	}
+
+	if code := Run(ctx, []string{"statusline"}, newCfg(`{"email":"tuannt.bkset@gmail.com"}`)); code != 0 {
+		t.Fatalf("statusline failed code=%d stderr=%s", code, stderr.String())
+	}
+	slOut := stdout.String()
+	var nttStatusLine string
+	for _, line := range strings.Split(slOut, "\n") {
+		if strings.Contains(line, "ntt.cn2.01@gmail.com") {
+			nttStatusLine = line
+			break
+		}
+	}
+	if !strings.HasPrefix(nttStatusLine, "> ntt.cn2.01@gmail.com") || !strings.Contains(nttStatusLine, "100%/86%") || strings.Contains(nttStatusLine, "51%") {
+		t.Fatalf("statusline ntt.cn2.01 row = %q, want > prefix and 100%%/86%%:\n%s", nttStatusLine, slOut)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"ls"}, newCfg("")); code != 0 {
+		t.Fatalf("ls failed code=%d stderr=%s", code, stderr.String())
+	}
+	lsOut := stdout.String()
+	var nttLsLine string
+	for _, line := range strings.Split(lsOut, "\n") {
+		if strings.Contains(line, "ntt.cn2.01@gmail.com") {
+			nttLsLine = line
+			break
+		}
+	}
+	if !strings.Contains(nttLsLine, "100%/86%") || strings.Contains(nttLsLine, "51%") {
+		t.Fatalf("ls ntt.cn2.01 row = %q, want 100%%/86%%:\n%s", nttLsLine, lsOut)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"quota", "--cached"}, newCfg("")); code != 0 {
+		t.Fatalf("quota --cached failed code=%d stderr=%s", code, stderr.String())
+	}
+	quotaOut := stdout.String()
+	var rank1Line, epochLine string
+	for _, line := range strings.Split(quotaOut, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "1 ") && strings.Contains(trimmed, "ntt.cn2.01@gmail.com") {
+			rank1Line = line
+		}
+		if strings.Contains(line, "epoch-zero@example.com") && strings.Contains(line, "quota_exhausted") {
+			epochLine = line
+		}
+	}
+	if rank1Line == "" || !strings.Contains(rank1Line, "86%") {
+		t.Fatalf("expected ntt.cn2.01@gmail.com ranked #1 at 86%% in quota --cached:\n%s", quotaOut)
+	}
+	if !strings.Contains(quotaOut, "5h [##########] 100.00% -") || !strings.Contains(quotaOut, "wk [#########.]  85.90%") {
+		t.Fatalf("expected expired 5h reset to 100.00%% and wk at 85.90%% in quota --cached:\n%s", quotaOut)
+	}
+	if epochLine == "" {
+		t.Fatalf("expected epoch-zero@example.com to remain quota_exhausted in quota --cached:\n%s", quotaOut)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"next", "--no-refresh"}, newCfg("")); code != 0 {
+		t.Fatalf("next --no-refresh failed code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Switched active account to ntt.cn2.01@gmail.com") {
+		t.Fatalf("expected next to select ntt.cn2.01@gmail.com, got:\n%s", stdout.String())
+	}
+}
+
+func TestLegacyArgonStateOmittedFromTablesAndArgonModelSelectsGemini(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 25, 18, 0, 0, 0, time.UTC)
+	paths, st := setupCLIEnv(t)
+
+	legacyJSON := `{
+  "schema_version": 1,
+  "generation": 2,
+  "active_key": "old@example.com",
+  "policy": {
+    "mode": "highest_remaining",
+    "target_pool": "gemini-argon",
+    "min_remaining_threshold": 0.05,
+    "cooldown_default": 300000000000,
+    "refresh_skew": 300000000000
+  },
+  "accounts": {
+    "old@example.com": {
+      "key": "old@example.com",
+      "email": "old@example.com",
+      "health": {"status": "ready", "updated_at": "2026-11-25T17:00:00Z"},
+      "creds": {"access_token": "at-old", "refresh_token": "rt-old", "expiry": "2026-11-25T19:00:00Z"},
+      "quota": {
+        "fetched_at": "2026-11-21T17:00:00Z",
+        "source": "retrieveUserQuotaSummary",
+        "tier": "pro",
+        "buckets": [
+          {"group_id": "gemini-5h", "pool": "gemini", "window": "5h", "remaining_fraction": 0.25},
+          {"group_id": "gemini-weekly", "pool": "gemini", "window": "weekly", "remaining_fraction": 0.90},
+          {"group_id": "3p-5h", "pool": "3p", "window": "5h", "remaining_fraction": 1.0},
+          {"group_id": "3p-weekly", "pool": "3p", "window": "weekly", "remaining_fraction": 1.0},
+          {"group_id": "gemini-argon-wtu-weekly", "pool": "gemini-argon", "window": "weekly", "remaining_fraction": 1.0}
+        ]
+      },
+      "added_at": "2026-11-21T17:00:00Z"
+    },
+    "fresh@example.com": {
+      "key": "fresh@example.com",
+      "email": "fresh@example.com",
+      "health": {"status": "ready", "updated_at": "2026-11-25T17:00:00Z"},
+      "creds": {"access_token": "at-fresh", "refresh_token": "rt-fresh", "expiry": "2026-11-25T19:00:00Z"},
+      "quota": {
+        "fetched_at": "2026-11-25T17:30:00Z",
+        "source": "retrieveUserQuotaSummary",
+        "tier": "pro",
+        "buckets": [
+          {"group_id": "gemini-5h", "pool": "gemini", "window": "5h", "remaining_fraction": 0.95},
+          {"group_id": "gemini-weekly", "pool": "gemini", "window": "weekly", "remaining_fraction": 0.95},
+          {"group_id": "3p-5h", "pool": "3p", "window": "5h", "remaining_fraction": 1.0},
+          {"group_id": "3p-weekly", "pool": "3p", "window": "weekly", "remaining_fraction": 1.0}
+        ]
+      },
+      "added_at": "2026-11-25T17:00:00Z"
+    }
+  }
+}`
+	if err := platform.WriteFileAtomic(paths.StateFile(), []byte(legacyJSON), true); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	newCfg := func(stdin string) Config {
+		return Config{
+			Store:   st,
+			OAuth:   &stubOAuth{},
+			Fetcher: &stubFetcher{},
+			Stdin:   strings.NewReader(stdin),
+			Stdout:  &stdout,
+			Stderr:  &stderr,
+			Now:     func() time.Time { return now },
+		}
+	}
+
+	if code := Run(ctx, []string{"accounts"}, newCfg("")); code != 0 {
+		t.Fatalf("accounts failed code=%d stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(strings.ToUpper(stdout.String()), "ARGON") {
+		t.Fatalf("accounts output unexpectedly contained ARGON:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"statusline"}, newCfg(`{"email":"old@example.com"}`)); code != 0 {
+		t.Fatalf("statusline failed code=%d stderr=%s", code, stderr.String())
+	}
+	slOut := stdout.String()
+	if strings.Contains(strings.ToUpper(slOut), "ARGON") || strings.Contains(slOut, "OTHER") {
+		t.Fatalf("statusline unexpectedly contained ARGON or OTHER:\n%s", slOut)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"quota", "--cached"}, newCfg("")); code != 0 {
+		t.Fatalf("quota --cached failed code=%d stderr=%s", code, stderr.String())
+	}
+	qOut := stdout.String()
+	if strings.Contains(strings.ToLower(qOut), "argon") || strings.Contains(strings.ToLower(qOut), "other") {
+		t.Fatalf("quota --cached unexpectedly contained argon or other:\n%s", qOut)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"switch", "--model", "gemini-4-argon-high", "--no-refresh", "--json"}, newCfg("")); code != 0 {
+		t.Fatalf("switch --model gemini-4-argon-high failed code=%d stderr=%s", code, stderr.String())
+	}
+	var sw SwitchResultView
+	if err := json.Unmarshal(stdout.Bytes(), &sw); err != nil {
+		t.Fatalf("unmarshal switch output: %v\n%s", err, stdout.String())
+	}
+	if sw.Outcome != domain.OutcomeSwitched || sw.ToKey != "fresh@example.com" || sw.Pool != domain.PoolGemini {
+		t.Fatalf("switch result = %+v, want switched to fresh@example.com on PoolGemini", sw)
+	}
 }
 
 func hasDoctorCheck(checks []DoctorCheckView, name string, status DoctorStatus) bool {

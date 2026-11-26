@@ -44,6 +44,7 @@ func setupIsolatedHookEnv(t *testing.T) (platform.Paths, *store.FileStore) {
 	t.Setenv("MULTI_ANTI_ACCOUNT", "")
 	t.Setenv("MULTI_ANTI_ISOLATED", "")
 	t.Setenv("MULTI_ANTI_MANAGED", "")
+	t.Setenv("MULTI_ANTI_RUN_ID", "")
 	t.Setenv("SSH_TTY", "")
 
 	paths, err := platform.ResolvePaths()
@@ -719,10 +720,13 @@ func TestHandleStatusLine(t *testing.T) {
 		if len(lines) != 3 {
 			t.Fatalf("expected 3 status lines (header + 2 accounts), got %d:\n%s", len(lines), line)
 		}
-		for _, wantCol := range []string{"multi-anti", "GEMINI 5h/wk", "CLAUDE/GPT 5h/wk", "ARGON wk", "STATUS"} {
+		for _, wantCol := range []string{"multi-anti", "GEMINI 5h/wk", "CLAUDE/GPT 5h/wk", "STATUS"} {
 			if !strings.Contains(lines[0], wantCol) {
 				t.Fatalf("header missing %q in %q", wantCol, lines[0])
 			}
+		}
+		if strings.Contains(lines[0], "ARGON") {
+			t.Fatalf("header unexpectedly contained ARGON: %q", lines[0])
 		}
 		if !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "42%/-") || !strings.HasSuffix(lines[1], "active") {
 			t.Fatalf("unexpected row 1: %q", lines[1])
@@ -804,7 +808,6 @@ func TestHandleStatusLine(t *testing.T) {
 					{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.199},
 					{GroupID: "gemini-weekly", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.6155},
 					{GroupID: "3p-weekly", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0, ResetAt: &reset3P},
-					{GroupID: "gemini-argon-wtu-weekly", Pool: domain.PoolGeminiArgon, Window: domain.WindowWeekly, RemainingFraction: 1},
 				},
 			},
 		}
@@ -822,7 +825,6 @@ func TestHandleStatusLine(t *testing.T) {
 					{GroupID: "gemini-weekly", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.4181},
 					{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 1},
 					{GroupID: "3p-weekly", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0.4922},
-					{GroupID: "gemini-argon-wtu-weekly", Pool: domain.PoolGeminiArgon, Window: domain.WindowWeekly, RemainingFraction: 0.2578},
 				},
 			},
 		}
@@ -842,7 +844,6 @@ func TestHandleStatusLine(t *testing.T) {
 					{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0, ResetAt: &resetCarol5h},
 					{GroupID: "gemini-weekly", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.5557},
 					{GroupID: "3p-weekly", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0, ResetAt: &resetCarol3P},
-					{GroupID: "gemini-argon-wtu-weekly", Pool: domain.PoolGeminiArgon, Window: domain.WindowWeekly, RemainingFraction: 1},
 				},
 			},
 		}
@@ -879,18 +880,21 @@ func TestHandleStatusLine(t *testing.T) {
 				t.Fatalf("line %d too wide (%d chars >= 100): %q", i, len(ln), ln)
 			}
 		}
-		for _, wantCol := range []string{"multi-anti", "GEMINI 5h/wk", "CLAUDE/GPT 5h/wk", "ARGON wk", "STATUS"} {
+		for _, wantCol := range []string{"multi-anti", "GEMINI 5h/wk", "CLAUDE/GPT 5h/wk", "STATUS"} {
 			if !strings.Contains(lines[0], wantCol) {
 				t.Fatalf("header missing %q in %q", wantCol, lines[0])
 			}
 		}
-		if !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "20%/62%") || !strings.Contains(lines[1], "-/0%(158h)") || !strings.Contains(lines[1], "100%") || !strings.HasSuffix(lines[1], "active") {
+		if strings.Contains(lines[0], "ARGON") {
+			t.Fatalf("header unexpectedly contained ARGON: %q", lines[0])
+		}
+		if !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "20%/62%") || !strings.Contains(lines[1], "-/0%(158h)") || !strings.HasSuffix(lines[1], "active") {
 			t.Fatalf("unexpected active row: %q", lines[1])
 		}
-		if !strings.HasPrefix(lines[2], "> bob@example.com") || !strings.Contains(lines[2], "100%/42%") || !strings.Contains(lines[2], "100%/49%") || !strings.Contains(lines[2], "26%") || !strings.HasSuffix(lines[2], "next") {
+		if !strings.HasPrefix(lines[2], "> bob@example.com") || !strings.Contains(lines[2], "100%/42%") || !strings.Contains(lines[2], "100%/49%") || !strings.HasSuffix(lines[2], "next") {
 			t.Fatalf("unexpected next row: %q", lines[2])
 		}
-		if !strings.HasPrefix(lines[3], "  carol@example.com") || !strings.Contains(lines[3], "0%(3h36m)/56%") || !strings.Contains(lines[3], "-/0%(157h)") || !strings.Contains(lines[3], "100%") || !strings.HasSuffix(lines[3], "cooldown 3h36m") {
+		if !strings.HasPrefix(lines[3], "  carol@example.com") || !strings.Contains(lines[3], "0%(3h36m)/56%") || !strings.Contains(lines[3], "-/0%(157h)") || !strings.HasSuffix(lines[3], "cooldown 3h36m") {
 			t.Fatalf("unexpected cooldown row: %q", lines[3])
 		}
 		if !strings.HasPrefix(lines[4], "  dave@example.com") || !strings.Contains(lines[4], "  -  ") || !strings.HasSuffix(lines[4], "disabled") {
@@ -971,7 +975,7 @@ func TestHandleStatusLine(t *testing.T) {
 			t.Fatalf("HandleStatusLine(nil store) error = %v", err)
 		}
 		lines := strings.Split(out, "\n")
-		if len(lines) != 2 || !strings.HasPrefix(lines[1], "* guest@example.com") || !strings.Contains(lines[1], "42%/80%") || !strings.Contains(lines[1], "-/50%") || !strings.Contains(lines[1], "  -  ") || !strings.HasSuffix(lines[1], "active") {
+		if len(lines) != 2 || !strings.HasPrefix(lines[1], "* guest@example.com") || !strings.Contains(lines[1], "42%/80%") || !strings.Contains(lines[1], "-/50%") || strings.Contains(lines[0], "ARGON") || !strings.HasSuffix(lines[1], "active") {
 			t.Fatalf("unexpected nil-store status table:\n%s", out)
 		}
 
@@ -1004,7 +1008,7 @@ func TestHandleStatusLine(t *testing.T) {
 			t.Fatalf("HandleStatusLine(models-only) error = %v", err)
 		}
 		lines = strings.Split(out, "\n")
-		if len(lines) != 2 || !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "75%") || !strings.Contains(lines[1], "40%") || !strings.Contains(lines[1], "  -  ") || !strings.HasSuffix(lines[1], "active") {
+		if len(lines) != 2 || !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "75%") || !strings.Contains(lines[1], "40%") || strings.Contains(lines[0], "ARGON") || !strings.HasSuffix(lines[1], "active") {
 			t.Fatalf("unexpected models-only status table:\n%s", out)
 		}
 	})
@@ -1056,7 +1060,6 @@ func TestHandleStatusLine(t *testing.T) {
 			}
 		}
 
-		// Empty stdin still renders the managed table for manual CLI preview.
 		preview, err := h.HandleStatusLine(ctx, nil)
 		if err != nil {
 			t.Fatalf("HandleStatusLine(empty) error = %v", err)
@@ -1065,7 +1068,6 @@ func TestHandleStatusLine(t *testing.T) {
 			t.Fatalf("expected managed preview on empty stdin, got:\n%s", preview)
 		}
 
-		// Signed-in JSON renders the managed table.
 		signedIn, err := h.HandleStatusLine(ctx, []byte(`{"email":"alice@example.com"}`))
 		if err != nil {
 			t.Fatalf("HandleStatusLine(signed-in) error = %v", err)
@@ -1074,7 +1076,6 @@ func TestHandleStatusLine(t *testing.T) {
 			t.Fatalf("expected status table for signed-in payload, got:\n%s", signedIn)
 		}
 
-		// Empty store with signed-out JSON also stays hidden.
 		_, emptyStore := setupIsolatedHookEnv(t)
 		emptyHandler := NewHandler(HandlerConfig{Store: emptyStore, Now: func() time.Time { return now }})
 		for _, payload := range []string{`{}`, `{"email":""}`} {
@@ -1352,4 +1353,120 @@ func TestInstallerPluginAndStatusLine(t *testing.T) {
 
 func ptrTime(t time.Time) *time.Time {
 	return &t
+}
+
+func TestHandleStopResolvesSubagentRootConversationAndWritesRunSignal(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 25, 16, 40, 8, 0, time.UTC)
+	paths, st := setupIsolatedHookEnv(t)
+
+	exhaustedAcc := makeHookAccount("tuantranxinchao2000@gmail.com", 0.50, "tok-2000", "ref-2000", now.Add(time.Hour))
+	nextAcc := makeHookAccount("tuannt.bkset@gmail.com", 0.90, "tok-bkset", "ref-bkset", now.Add(time.Hour))
+	writeNativeToken(t, paths, exhaustedAcc)
+
+	if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+		s.ActiveKey = exhaustedAcc.Key
+		s.Accounts[exhaustedAcc.Key] = exhaustedAcc
+		s.Accounts[nextAcc.Key] = nextAcc
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	brainDir := filepath.Join(t.TempDir(), "brain")
+	rootID := "ceb19e39-6c65-41c8-8dfb-61ad2951a142"
+	subID := "3e8d6efd-bfe5-4c68-84d1-3ce86641122d"
+
+	rootTranscript := filepath.Join(brainDir, rootID, ".system_generated", "logs", "transcript.jsonl")
+	subTranscript := filepath.Join(brainDir, subID, ".system_generated", "logs", "transcript.jsonl")
+	if err := os.MkdirAll(filepath.Dir(rootTranscript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(subTranscript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rootStep := `{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}` + "\n"
+	subStep := `{"step_index":0,"source":"SYSTEM","type":"SYSTEM_MESSAGE","content":"[Message] timestamp=2026-11-25T16:38:10Z sender=ceb19e39-6c65-41c8-8dfb-61ad2951a142 priority=MESSAGE_PRIORITY_HIGH"}` + "\n"
+	if err := os.WriteFile(rootTranscript, []byte(rootStep), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(subTranscript, []byte(subStep), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("MULTI_ANTI_ACCOUNT", string(exhaustedAcc.Key))
+	t.Setenv("MULTI_ANTI_RUN_ID", "run-42")
+
+	h := NewHandler(HandlerConfig{Store: st, Now: func() time.Time { return now }})
+	subStdin, _ := json.Marshal(HookInput{
+		ConversationID:    subID,
+		TranscriptPath:    subTranscript,
+		ModelName:         "gemini-4-hydrogen-xhigh",
+		TerminationReason: "ERROR",
+		Error:             "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h58m27s.",
+	})
+
+	out, err := h.HandleStop(ctx, subStdin)
+	if err != nil {
+		t.Fatalf("HandleStop(subagent) error = %v", err)
+	}
+	var stopOut StopOutput
+	if err := json.Unmarshal(out, &stopOut); err != nil {
+		t.Fatalf("Unmarshal StopOutput error = %v", err)
+	}
+	if stopOut.Decision != "allow" || !strings.Contains(stopOut.Reason, "tuannt.bkset@gmail.com") {
+		t.Fatalf("unexpected subagent StopOutput: %+v", stopOut)
+	}
+
+	runSig, ok, err := ReadRunSwitchSignal(paths, "run-42")
+	if err != nil || !ok {
+		t.Fatalf("ReadRunSwitchSignal() = (%+v, %v, %v), want present", runSig, ok, err)
+	}
+	if runSig.ConversationID != rootID || runSig.ToKey != nextAcc.Key {
+		t.Fatalf("runSig = %+v, want ConversationID=%q ToKey=%q", runSig, rootID, nextAcc.Key)
+	}
+	latestSig, ok, err := ReadLatestSwitchSignal(paths)
+	if err != nil || !ok || latestSig.ConversationID != rootID || latestSig.ToKey != nextAcc.Key {
+		t.Fatalf("latestSig = (%+v, %v, %v), want ConversationID=%q ToKey=%q", latestSig, ok, err, rootID, nextAcc.Key)
+	}
+
+	stAfter, err := st.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantUntil := now.Add(3*time.Hour + 58*time.Minute + 27*time.Second)
+	gotUntil := stAfter.Accounts[exhaustedAcc.Key].Health.CooldownUntil
+	if stAfter.Accounts[exhaustedAcc.Key].Health.Status != domain.HealthCooldown || gotUntil == nil || !gotUntil.Equal(wantUntil) {
+		t.Fatalf("exhaustedAcc health = %+v, want cooldown until %v", stAfter.Accounts[exhaustedAcc.Key].Health, wantUntil)
+	}
+
+	if err := os.Remove(RunSignalPath(paths, "run-42")); err != nil {
+		t.Fatalf("Remove(RunSignalPath) error = %v", err)
+	}
+
+	parentStdin, _ := json.Marshal(HookInput{
+		ConversationID:    rootID,
+		TranscriptPath:    rootTranscript,
+		ModelName:         "gemini-4-hydrogen-xhigh",
+		TerminationReason: "ERROR",
+		Error:             "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h58m19s.",
+	})
+	if _, err := h.HandleStop(ctx, parentStdin); err != nil {
+		t.Fatalf("HandleStop(parent) error = %v", err)
+	}
+
+	stAfterParent, err := st.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stAfterParent.Accounts[nextAcc.Key].Health.EffectiveStatus(now) != domain.HealthReady {
+		t.Fatalf("nextAcc health = %+v, want HealthReady", stAfterParent.Accounts[nextAcc.Key].Health)
+	}
+	recreatedSig, ok, err := ReadRunSwitchSignal(paths, "run-42")
+	if err != nil || !ok {
+		t.Fatalf("ReadRunSwitchSignal() after parent Stop = (%+v, %v, %v), want recreated", recreatedSig, ok, err)
+	}
+	if recreatedSig.ConversationID != rootID || recreatedSig.ToKey != nextAcc.Key {
+		t.Fatalf("recreatedSig = %+v, want ConversationID=%q ToKey=%q", recreatedSig, rootID, nextAcc.Key)
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -190,7 +191,7 @@ func (h *Handler) HandleSessionStart(ctx context.Context, stdin []byte) ([]byte,
 		pool := resolveTargetPool(acc, state.Policy.TargetPool, input.ModelName)
 		remStr := "quota n/a"
 		if acc.Quota != nil {
-			if rem, _, hasPool := acc.Quota.PoolRemaining(pool); hasPool {
+			if rem, _, hasPool := acc.Quota.PoolRemainingAt(pool, now); hasPool {
 				remStr = fmt.Sprintf("%d%% remaining", roundPercent(rem))
 			}
 		}
@@ -238,8 +239,10 @@ func (h *Handler) HandleStop(ctx context.Context, stdin []byte) ([]byte, error) 
 
 	launchedKey := domain.AccountKey(strings.TrimSpace(os.Getenv("MULTI_ANTI_ACCOUNT")))
 	tokenKey := readNativeTokenKey(paths)
+	rootConvID := resolveRootConversationID(input.ConversationID, input.TranscriptPath)
 
-	if msg, skip := h.detectAlreadySwitched(paths, state, input, launchedKey, tokenKey, now); skip {
+	if msg, alreadyAcc, skip := h.detectAlreadySwitched(paths, state, input, rootConvID, launchedKey, tokenKey, now); skip {
+		h.syncSkippedStopSwitch(ctx, paths, state, input, rootConvID, launchedKey, alreadyAcc, retryDur, errSnippet, now)
 		return marshalStopAllow(msg)
 	}
 
@@ -261,10 +264,7 @@ func (h *Handler) HandleStop(ctx context.Context, stdin []byte) ([]byte, error) 
 		if !ok {
 			return fmt.Errorf("account %q not found", currentKey)
 		}
-		pool := resolveTargetPool(acc, s.Policy.TargetPool, input.ModelName)
-		resetAt := resolveCooldownDeadline(acc, pool, retryDur, now)
-		selector.MarkAccountCooldown(&acc, resetAt, cooldownReason, s.Policy.CooldownDefault, now)
-		selector.MarkPoolExhausted(&acc, pool, acc.Health.CooldownUntil)
+		markAccountQuotaCooldown(&acc, s.Policy, input.ModelName, retryDur, cooldownReason, now)
 		usedAt := now
 		acc.LastUsedAt = &usedAt
 		s.Accounts[currentKey] = acc
@@ -331,7 +331,7 @@ func (h *Handler) HandleStop(ctx context.Context, stdin []byte) ([]byte, error) 
 	}
 
 	_ = WriteSwitchSignal(paths, domain.HookSwitchSignal{
-		ConversationID: strings.TrimSpace(input.ConversationID),
+		ConversationID: rootConvID,
 		FromKey:        currentKey,
 		ToKey:          targetAcc.Key,
 		Reason:         finalDecision.Reason,
@@ -397,35 +397,87 @@ func (h *Handler) detectAlreadySwitched(
 	paths platform.Paths,
 	state domain.StoreState,
 	input HookInput,
+	rootConvID string,
 	launchedKey domain.AccountKey,
 	tokenKey domain.AccountKey,
 	now time.Time,
-) (string, bool) {
+) (string, domain.Account, bool) {
 	isolated := os.Getenv("MULTI_ANTI_ISOLATED") == "1"
 	if !isolated && launchedKey != "" && tokenKey != "" && tokenKey != launchedKey {
 		if tokAcc, ok := state.Accounts[tokenKey]; ok && tokAcc.Health.CanSelect(now) {
-			return fmt.Sprintf("multi-anti: already switched to %s", displayAccount(tokAcc)), true
+			return fmt.Sprintf("multi-anti: already switched to %s", displayAccount(tokAcc)), tokAcc, true
 		}
 	}
 
 	if !isolated && tokenKey != "" && state.ActiveKey != "" && tokenKey != state.ActiveKey {
 		if tokAcc, ok := state.Accounts[tokenKey]; ok && tokAcc.Health.CanSelect(now) {
-			return fmt.Sprintf("multi-anti: already switched to %s", displayAccount(tokAcc)), true
+			return fmt.Sprintf("multi-anti: already switched to %s", displayAccount(tokAcc)), tokAcc, true
 		}
 	}
 
-	if cid := strings.TrimSpace(input.ConversationID); cid != "" {
+	cids := make([]string, 0, 2)
+	if r := strings.TrimSpace(rootConvID); r != "" {
+		cids = append(cids, r)
+	}
+	if in := strings.TrimSpace(input.ConversationID); in != "" && (len(cids) == 0 || cids[0] != in) {
+		cids = append(cids, in)
+	}
+	for _, cid := range cids {
 		if sig, ok, _ := ReadSwitchSignal(paths, cid); ok && sig.ToKey != "" {
 			if tokAcc, exists := state.Accounts[sig.ToKey]; exists && tokAcc.Health.CanSelect(now) {
 				if (isolated && launchedKey != "" && sig.ToKey != launchedKey) ||
 					(!isolated && tokenKey == sig.ToKey && !sig.At.IsZero() && now.Sub(sig.At) >= 0 && now.Sub(sig.At) <= stopHookDedupWindow) {
-					return fmt.Sprintf("multi-anti: already switched to %s", displayAccount(tokAcc)), true
+					return fmt.Sprintf("multi-anti: already switched to %s", displayAccount(tokAcc)), tokAcc, true
 				}
 			}
 		}
 	}
 
-	return "", false
+	return "", domain.Account{}, false
+}
+
+func markAccountQuotaCooldown(acc *domain.Account, policy domain.SelectionPolicy, modelName string, retryDur *time.Duration, cooldownReason string, now time.Time) {
+	pool := resolveTargetPool(*acc, policy.TargetPool, modelName)
+	resetAt := resolveCooldownDeadline(*acc, pool, retryDur, now)
+	selector.MarkAccountCooldown(acc, resetAt, cooldownReason, policy.CooldownDefault, now)
+	selector.MarkPoolExhausted(acc, pool, acc.Health.CooldownUntil)
+}
+
+func (h *Handler) syncSkippedStopSwitch(
+	ctx context.Context,
+	paths platform.Paths,
+	state domain.StoreState,
+	input HookInput,
+	rootConvID string,
+	launchedKey domain.AccountKey,
+	targetAcc domain.Account,
+	retryDur *time.Duration,
+	errSnippet string,
+	now time.Time,
+) {
+	if launchedKey != "" && targetAcc.Key != "" && targetAcc.Key != launchedKey {
+		if acc, ok := state.Accounts[launchedKey]; ok && acc.Health.EffectiveStatus(now) == domain.HealthReady {
+			cooldownReason := formatCooldownReason(errSnippet)
+			_, _ = h.store.Update(ctx, func(s *domain.StoreState) error {
+				cur, exists := s.Accounts[launchedKey]
+				if !exists || cur.Health.EffectiveStatus(now) != domain.HealthReady {
+					return nil
+				}
+				markAccountQuotaCooldown(&cur, s.Policy, input.ModelName, retryDur, cooldownReason, now)
+				s.Accounts[launchedKey] = cur
+				return nil
+			})
+		}
+	}
+	if strings.TrimSpace(os.Getenv("MULTI_ANTI_RUN_ID")) != "" && targetAcc.Key != "" && targetAcc.Key != launchedKey {
+		_ = WriteSwitchSignal(paths, domain.HookSwitchSignal{
+			ConversationID: rootConvID,
+			FromKey:        launchedKey,
+			ToKey:          targetAcc.Key,
+			Reason:         "already switched to " + displayAccount(targetAcc),
+			At:             now,
+		})
+	}
 }
 
 func (h *Handler) prepareStopSwitchTarget(
@@ -699,7 +751,7 @@ func formatAccountRowStatus(acc domain.Account, isActive, isNext bool, now time.
 	return healthStr
 }
 
-func extractPoolSlots(snap *domain.QuotaSnapshot, pool domain.QuotaPool) (slot5h, slotWeekly, slotUnknown statusWindowSlot, ok bool) {
+func extractPoolSlots(snap *domain.QuotaSnapshot, pool domain.QuotaPool, now time.Time) (slot5h, slotWeekly, slotUnknown statusWindowSlot, ok bool) {
 	if snap == nil {
 		return slot5h, slotWeekly, slotUnknown, false
 	}
@@ -708,19 +760,20 @@ func extractPoolSlots(snap *domain.QuotaSnapshot, pool domain.QuotaPool) (slot5h
 			if b.Pool != pool {
 				continue
 			}
+			rem, resetAt := b.EffectiveAt(now)
 			switch b.Window {
 			case domain.Window5h:
-				slot5h.add(b.RemainingFraction, b.ResetAt)
+				slot5h.add(rem, resetAt)
 			case domain.WindowWeekly:
-				slotWeekly.add(b.RemainingFraction, b.ResetAt)
+				slotWeekly.add(rem, resetAt)
 			default:
-				slotUnknown.add(b.RemainingFraction, b.ResetAt)
+				slotUnknown.add(rem, resetAt)
 			}
 		}
 		return slot5h, slotWeekly, slotUnknown, slot5h.has || slotWeekly.has || slotUnknown.has
 	}
 	if len(snap.Models) > 0 {
-		rem, resetAt, has := snap.PoolRemaining(pool)
+		rem, resetAt, has := snap.PoolRemainingAt(pool, now)
 		if has {
 			slotUnknown.add(rem, resetAt)
 			return slot5h, slotWeekly, slotUnknown, true
@@ -731,7 +784,7 @@ func extractPoolSlots(snap *domain.QuotaSnapshot, pool domain.QuotaPool) (slot5h
 
 // FormatDualWindowCell renders a compact "5h/wk" cell for pool inside snap, using "-" for missing data.
 func FormatDualWindowCell(snap *domain.QuotaSnapshot, pool domain.QuotaPool, now time.Time) string {
-	slot5h, slotWeekly, slotUnknown, ok := extractPoolSlots(snap, pool)
+	slot5h, slotWeekly, slotUnknown, ok := extractPoolSlots(snap, pool, now)
 	if !ok {
 		return "-"
 	}
@@ -749,9 +802,8 @@ func FormatDualWindowCell(snap *domain.QuotaSnapshot, pool domain.QuotaPool, now
 	return formatStatusWindowReading("", slotUnknown.rem, slotUnknown.resetAt, now)
 }
 
-// FormatSingleOrDualWindowCell renders a compact single-window (weekly) or "5h/wk" cell for pool inside snap.
-func FormatSingleOrDualWindowCell(snap *domain.QuotaSnapshot, pool domain.QuotaPool, now time.Time) string {
-	slot5h, slotWeekly, slotUnknown, ok := extractPoolSlots(snap, pool)
+func formatSingleOrDualWindowCell(snap *domain.QuotaSnapshot, pool domain.QuotaPool, now time.Time) string {
+	slot5h, slotWeekly, slotUnknown, ok := extractPoolSlots(snap, pool, now)
 	if !ok {
 		return "-"
 	}
@@ -771,7 +823,7 @@ func FormatSingleOrDualWindowCell(snap *domain.QuotaSnapshot, pool domain.QuotaP
 func renderStatusTable(rows []statusTableRow, now time.Time) string {
 	hasOther := false
 	for _, r := range rows {
-		if _, _, _, ok := extractPoolSlots(r.snap, domain.PoolOther); ok {
+		if _, _, _, ok := extractPoolSlots(r.snap, domain.PoolOther, now); ok {
 			hasOther = true
 			break
 		}
@@ -780,21 +832,20 @@ func renderStatusTable(rows []statusTableRow, now time.Time) string {
 	var buf bytes.Buffer
 	tw := tabwriter.NewWriter(&buf, 0, 2, 2, ' ', 0)
 	if hasOther {
-		fmt.Fprintln(tw, "multi-anti\tGEMINI 5h/wk\tCLAUDE/GPT 5h/wk\tARGON wk\tOTHER\tSTATUS")
+		fmt.Fprintln(tw, "multi-anti\tGEMINI 5h/wk\tCLAUDE/GPT 5h/wk\tOTHER\tSTATUS")
 	} else {
-		fmt.Fprintln(tw, "multi-anti\tGEMINI 5h/wk\tCLAUDE/GPT 5h/wk\tARGON wk\tSTATUS")
+		fmt.Fprintln(tw, "multi-anti\tGEMINI 5h/wk\tCLAUDE/GPT 5h/wk\tSTATUS")
 	}
 
 	for _, r := range rows {
 		acctCell := r.marker + " " + sanitizeSingleLine(r.label)
 		gemCell := FormatDualWindowCell(r.snap, domain.PoolGemini, now)
 		cpCell := FormatDualWindowCell(r.snap, domain.Pool3P, now)
-		argCell := FormatSingleOrDualWindowCell(r.snap, domain.PoolGeminiArgon, now)
 		if hasOther {
-			otherCell := FormatSingleOrDualWindowCell(r.snap, domain.PoolOther, now)
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", acctCell, gemCell, cpCell, argCell, otherCell, sanitizeSingleLine(r.status))
+			otherCell := formatSingleOrDualWindowCell(r.snap, domain.PoolOther, now)
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", acctCell, gemCell, cpCell, otherCell, sanitizeSingleLine(r.status))
 		} else {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", acctCell, gemCell, cpCell, argCell, sanitizeSingleLine(r.status))
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", acctCell, gemCell, cpCell, sanitizeSingleLine(r.status))
 		}
 	}
 	_ = tw.Flush()
@@ -928,110 +979,7 @@ func applyStatusLineBuckets(acc *domain.Account, input StatusLineInput, now time
 		}
 		rem := clampFraction(*reading.RemainingFraction)
 		resetAt := parseStatusLineReset(reading, now)
-
-		matchedBucket := false
-		for i := range snap.Buckets {
-			if strings.EqualFold(snap.Buckets[i].GroupID, bucketKey) ||
-				strings.EqualFold(snap.Buckets[i].DisplayName, bucketKey) {
-				if updateBucketReading(&snap.Buckets[i], rem, resetAt) {
-					changed = true
-				}
-				matchedBucket = true
-			}
-		}
-		if matchedBucket {
-			continue
-		}
-
-		inferredPool := inferStatusLinePool(bucketKey)
-		inferredWindow := inferStatusLineWindow(bucketKey)
-		if inferredPool != domain.PoolOther {
-			if inferredWindow != domain.WindowUnknown {
-				for i := range snap.Buckets {
-					if snap.Buckets[i].Pool != inferredPool {
-						continue
-					}
-					if snap.Buckets[i].Window != domain.WindowUnknown && snap.Buckets[i].Window != inferredWindow {
-						continue
-					}
-					if updateBucketReading(&snap.Buckets[i], rem, resetAt) {
-						changed = true
-					}
-					matchedBucket = true
-				}
-			} else {
-				var poolIdx, unknownIdx []int
-				for i := range snap.Buckets {
-					if snap.Buckets[i].Pool != inferredPool {
-						continue
-					}
-					poolIdx = append(poolIdx, i)
-					if snap.Buckets[i].Window == domain.WindowUnknown {
-						unknownIdx = append(unknownIdx, i)
-					}
-				}
-				switch {
-				case len(unknownIdx) > 0:
-					for _, idx := range unknownIdx {
-						if updateBucketReading(&snap.Buckets[idx], rem, resetAt) {
-							changed = true
-						}
-					}
-					matchedBucket = true
-				case len(poolIdx) == 1:
-					if updateBucketReading(&snap.Buckets[poolIdx[0]], rem, resetAt) {
-						changed = true
-					}
-					matchedBucket = true
-				case len(poolIdx) > 1:
-					if resetAt != nil {
-						var matchedResetIdx int
-						matchCount := 0
-						for _, idx := range poolIdx {
-							if snap.Buckets[idx].ResetAt != nil && resetTimesMatch(*snap.Buckets[idx].ResetAt, *resetAt) {
-								matchedResetIdx = idx
-								matchCount++
-							}
-						}
-						if matchCount == 1 {
-							if updateBucketReading(&snap.Buckets[matchedResetIdx], rem, resetAt) {
-								changed = true
-							}
-						}
-					}
-					// Keep distinct 5h/weekly buckets isolated instead of overwriting all windows blindly.
-					matchedBucket = true
-				}
-			}
-		}
-		if matchedBucket {
-			continue
-		}
-
-		matchedModel := false
-		for i := range snap.Models {
-			if strings.EqualFold(snap.Models[i].ModelID, bucketKey) ||
-				strings.EqualFold(snap.Models[i].DisplayName, bucketKey) ||
-				(inferredPool != domain.PoolOther && snap.InferPoolForModel(snap.Models[i].ModelID) == inferredPool) {
-				if updateModelReading(&snap.Models[i], rem, resetAt) {
-					changed = true
-				}
-				matchedModel = true
-			}
-		}
-		if matchedModel {
-			continue
-		}
-
-		if created || (len(snap.Buckets) == 0 && len(snap.Models) == 0) {
-			snap.Buckets = append(snap.Buckets, domain.QuotaBucket{
-				GroupID:           bucketKey,
-				DisplayName:       bucketKey,
-				Pool:              inferredPool,
-				Window:            inferredWindow,
-				RemainingFraction: rem,
-				ResetAt:           resetAt,
-			})
+		if mergeSingleStatusBucket(&snap, created, bucketKey, rem, resetAt) {
 			changed = true
 		}
 	}
@@ -1041,6 +989,127 @@ func applyStatusLineBuckets(acc *domain.Account, input StatusLineInput, now time
 	}
 	snap.FetchedAt = now
 	return &snap, true
+}
+
+func mergeSingleStatusBucket(snap *domain.QuotaSnapshot, created bool, bucketKey string, rem float64, resetAt *time.Time) bool {
+	matched := false
+	changed := false
+	for i := range snap.Buckets {
+		if strings.EqualFold(snap.Buckets[i].GroupID, bucketKey) ||
+			strings.EqualFold(snap.Buckets[i].DisplayName, bucketKey) {
+			if updateBucketReading(&snap.Buckets[i], rem, resetAt) {
+				changed = true
+			}
+			matched = true
+		}
+	}
+	if matched {
+		return changed
+	}
+
+	inferredPool := inferStatusLinePool(bucketKey)
+	inferredWindow := inferStatusLineWindow(bucketKey)
+	if inferredPool != domain.PoolOther {
+		if poolMatched, poolChanged := updatePoolMatchingBuckets(snap.Buckets, inferredPool, inferredWindow, rem, resetAt); poolMatched {
+			return poolChanged
+		}
+	}
+
+	modelMatched := false
+	for i := range snap.Models {
+		if strings.EqualFold(snap.Models[i].ModelID, bucketKey) ||
+			strings.EqualFold(snap.Models[i].DisplayName, bucketKey) ||
+			(inferredPool != domain.PoolOther && snap.InferPoolForModel(snap.Models[i].ModelID) == inferredPool) {
+			if updateModelReading(&snap.Models[i], rem, resetAt) {
+				changed = true
+			}
+			modelMatched = true
+		}
+	}
+	if modelMatched {
+		return changed
+	}
+
+	if created || (len(snap.Buckets) == 0 && len(snap.Models) == 0) {
+		snap.Buckets = append(snap.Buckets, domain.QuotaBucket{
+			GroupID:           bucketKey,
+			DisplayName:       bucketKey,
+			Pool:              inferredPool,
+			Window:            inferredWindow,
+			RemainingFraction: rem,
+			ResetAt:           resetAt,
+		})
+		return true
+	}
+	return false
+}
+
+func updatePoolMatchingBuckets(
+	buckets []domain.QuotaBucket,
+	pool domain.QuotaPool,
+	window domain.QuotaWindow,
+	rem float64,
+	resetAt *time.Time,
+) (matched bool, changed bool) {
+	if window != domain.WindowUnknown {
+		for i := range buckets {
+			if buckets[i].Pool != pool {
+				continue
+			}
+			if buckets[i].Window != domain.WindowUnknown && buckets[i].Window != window {
+				continue
+			}
+			if updateBucketReading(&buckets[i], rem, resetAt) {
+				changed = true
+			}
+			matched = true
+		}
+		return matched, changed
+	}
+
+	var poolIdx, unknownIdx []int
+	for i := range buckets {
+		if buckets[i].Pool != pool {
+			continue
+		}
+		poolIdx = append(poolIdx, i)
+		if buckets[i].Window == domain.WindowUnknown {
+			unknownIdx = append(unknownIdx, i)
+		}
+	}
+	switch {
+	case len(unknownIdx) > 0:
+		for _, idx := range unknownIdx {
+			if updateBucketReading(&buckets[idx], rem, resetAt) {
+				changed = true
+			}
+		}
+		return true, changed
+	case len(poolIdx) == 1:
+		return true, updateBucketReading(&buckets[poolIdx[0]], rem, resetAt)
+	case len(poolIdx) > 1:
+		return true, updateUniqueResetMatchingBucket(buckets, poolIdx, rem, resetAt)
+	default:
+		return false, false
+	}
+}
+
+func updateUniqueResetMatchingBucket(buckets []domain.QuotaBucket, poolIdx []int, rem float64, resetAt *time.Time) bool {
+	if resetAt == nil {
+		return false
+	}
+	var matchedResetIdx int
+	matchCount := 0
+	for _, idx := range poolIdx {
+		if buckets[idx].ResetAt != nil && resetTimesMatch(*buckets[idx].ResetAt, *resetAt) {
+			matchedResetIdx = idx
+			matchCount++
+		}
+	}
+	if matchCount != 1 {
+		return false
+	}
+	return updateBucketReading(&buckets[matchedResetIdx], rem, resetAt)
 }
 
 func updateBucketReading(b *domain.QuotaBucket, rem float64, resetAt *time.Time) bool {
@@ -1082,15 +1151,8 @@ func timePtrEqual(a, b *time.Time) bool {
 }
 
 func parseStatusLineReset(b StatusLineQuotaBucket, now time.Time) *time.Time {
-	if raw := strings.TrimSpace(b.ResetTime); raw != "" {
-		if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
-			utc := t.UTC()
-			return &utc
-		}
-		if t, err := time.Parse(time.RFC3339, raw); err == nil {
-			utc := t.UTC()
-			return &utc
-		}
+	if t, err := quota.ParseOptionalTime(b.ResetTime); err == nil && t != nil {
+		return t
 	}
 	if b.ResetInSeconds != nil && *b.ResetInSeconds > 0 {
 		utc := now.Add(time.Duration(*b.ResetInSeconds * float64(time.Second))).UTC()
@@ -1178,7 +1240,7 @@ func detectTranscriptTailQuotaError(tail string) (matched bool, retryDur *time.D
 			if err := json.Unmarshal([]byte(line), &step); err == nil {
 				isErrorStep := strings.TrimSpace(step.Error) != "" ||
 					strings.EqualFold(strings.TrimSpace(step.Status), "ERROR") ||
-					strings.EqualFold(strings.TrimSpace(step.Type), "ERROR")
+					strings.Contains(strings.ToUpper(strings.TrimSpace(step.Type)), "ERROR")
 				if !isErrorStep {
 					if checked > 1 {
 						break
@@ -1315,7 +1377,7 @@ func resolveCooldownDeadline(acc domain.Account, pool domain.QuotaPool, retryDur
 		return &t
 	}
 	if acc.Quota != nil {
-		if _, resetAt, ok := acc.Quota.PoolRemaining(pool); ok && resetAt != nil && resetAt.After(now) {
+		if _, resetAt, ok := acc.Quota.PoolRemainingAt(pool, now); ok && resetAt != nil && resetAt.After(now) {
 			t := resetAt.UTC()
 			return &t
 		}
@@ -1433,15 +1495,89 @@ func LatestSignalPath(paths platform.Paths) string {
 	return filepath.Join(paths.SignalsDir(), "latest.json")
 }
 
-// SignalPath returns the signal file path scoped to conversationID inside SignalsDir.
-func SignalPath(paths platform.Paths, conversationID string) string {
-	clean := strings.TrimSpace(conversationID)
-	if clean == "" {
-		return LatestSignalPath(paths)
+var subagentSenderPattern = regexp.MustCompile(`\bsender=([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b`)
+
+func resolveRootConversationID(conversationID, transcriptPath string) string {
+	curID := strings.TrimSpace(conversationID)
+	curPath := strings.TrimSpace(transcriptPath)
+	if curID == "" || curPath == "" {
+		return curID
 	}
+
+	visited := map[string]bool{curID: true}
+	for range 8 {
+		firstLine := readFirstTranscriptLine(curPath, transcriptTailBytes)
+		if firstLine == "" {
+			return curID
+		}
+		var step0 struct {
+			Source  string `json:"source"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(firstLine), &step0); err != nil {
+			return curID
+		}
+		if !strings.EqualFold(strings.TrimSpace(step0.Source), "SYSTEM") {
+			return curID
+		}
+		m := subagentSenderPattern.FindStringSubmatch(step0.Content)
+		if len(m) != 2 {
+			return curID
+		}
+		parentID := m[1]
+		if visited[parentID] {
+			return curID
+		}
+		visited[parentID] = true
+		nextPath := replaceConversationPathSegment(curPath, curID, parentID)
+		curID = parentID
+		if nextPath == "" {
+			return curID
+		}
+		if _, err := os.Stat(nextPath); err != nil {
+			return curID
+		}
+		curPath = nextPath
+	}
+	return curID
+}
+
+func readFirstTranscriptLine(path string, maxBytes int64) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	buf, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	if err != nil || len(buf) == 0 {
+		return ""
+	}
+	line, _, _ := bytes.Cut(buf, []byte{'\n'})
+	return strings.TrimSpace(string(line))
+}
+
+func replaceConversationPathSegment(path, fromID, toID string) string {
+	cleaned := filepath.Clean(path)
+	sep := string(filepath.Separator)
+	parts := strings.Split(cleaned, sep)
+	replaced := false
+	for i, part := range parts {
+		if part == fromID {
+			parts[i] = toID
+			replaced = true
+		}
+	}
+	if !replaced {
+		return ""
+	}
+	return strings.Join(parts, sep)
+}
+
+func sanitizeSignalSlug(raw, prefix string) string {
 	var b strings.Builder
-	for i := 0; i < len(clean); i++ {
-		c := clean[i]
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
 			b.WriteByte(c)
 		} else {
@@ -1450,13 +1586,23 @@ func SignalPath(paths platform.Paths, conversationID string) string {
 	}
 	slug := strings.Trim(b.String(), "_")
 	if slug == "" || len(slug) > 64 {
-		sum := sha256.Sum256([]byte(clean))
-		slug = fmt.Sprintf("conv-%x", sum[:8])
+		sum := sha256.Sum256([]byte(raw))
+		slug = fmt.Sprintf("%s-%x", prefix, sum[:8])
 	}
-	return filepath.Join(paths.SignalsDir(), slug+".json")
+	return slug
 }
 
-// WriteSwitchSignal atomically persists sig to latest.json and (when ConversationID is set) its scoped file.
+// SignalPath returns the signal file path scoped to conversationID inside SignalsDir.
+func SignalPath(paths platform.Paths, conversationID string) string {
+	clean := strings.TrimSpace(conversationID)
+	if clean == "" {
+		return LatestSignalPath(paths)
+	}
+	return filepath.Join(paths.SignalsDir(), sanitizeSignalSlug(clean, "conv")+".json")
+}
+
+// WriteSwitchSignal atomically persists sig to latest.json, any scoped conversationId file,
+// and any active MULTI_ANTI_RUN_ID per-run signal file.
 func WriteSwitchSignal(paths platform.Paths, sig domain.HookSwitchSignal) error {
 	if err := platform.EnsurePrivateDir(paths.SignalsDir()); err != nil {
 		return fmt.Errorf("ensure signals dir %q: %w", paths.SignalsDir(), err)
@@ -1472,6 +1618,11 @@ func WriteSwitchSignal(paths platform.Paths, sig domain.HookSwitchSignal) error 
 	}
 	if cid := strings.TrimSpace(sig.ConversationID); cid != "" {
 		if err := platform.WriteFileAtomic(SignalPath(paths, cid), data, true); err != nil {
+			return err
+		}
+	}
+	if runPath := RunSignalPath(paths, os.Getenv("MULTI_ANTI_RUN_ID")); runPath != "" {
+		if err := platform.WriteFileAtomic(runPath, data, true); err != nil {
 			return err
 		}
 	}
@@ -1501,6 +1652,36 @@ func readSignalFile(path string) (domain.HookSwitchSignal, bool, error) {
 		return domain.HookSwitchSignal{}, false, fmt.Errorf("parse switch signal %q: %w", path, err)
 	}
 	return sig, true, nil
+}
+
+// RunSignalPath returns the per-run Stop-hook switch signal file path under SignalsDir.
+func RunSignalPath(paths platform.Paths, runID string) string {
+	clean := strings.TrimSpace(runID)
+	if clean == "" {
+		return ""
+	}
+	return filepath.Join(paths.SignalsDir(), "run-"+sanitizeSignalSlug(clean, "run")+".json")
+}
+
+// ReadRunSwitchSignal reads the switch signal scoped to runID, returning (zero, false, nil) when absent.
+func ReadRunSwitchSignal(paths platform.Paths, runID string) (domain.HookSwitchSignal, bool, error) {
+	p := RunSignalPath(paths, runID)
+	if p == "" {
+		return domain.HookSwitchSignal{}, false, nil
+	}
+	return readSignalFile(p)
+}
+
+// ClearRunSwitchSignal removes the switch signal file scoped to runID if present.
+func ClearRunSwitchSignal(paths platform.Paths, runID string) error {
+	p := RunSignalPath(paths, runID)
+	if p == "" {
+		return nil
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove run signal %q: %w", p, err)
+	}
+	return nil
 }
 
 // ClearSwitchSignals removes all pending signal JSON files from SignalsDir.

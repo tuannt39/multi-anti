@@ -157,8 +157,8 @@ func TestQuotaSnapshotPoolRemaining(t *testing.T) {
 			t.Fatalf("PoolRemaining(\"\") = (%v, %v, %v), want (0.25, %v, true)", rem, resetAt, ok, t1)
 		}
 
-		if _, _, ok := snap.PoolRemaining(PoolGeminiArgon); ok {
-			t.Fatalf("PoolRemaining(gemini-argon) unexpectedly found data")
+		if _, _, ok := snap.PoolRemaining(PoolOther); ok {
+			t.Fatalf("PoolRemaining(other) unexpectedly found data")
 		}
 	})
 
@@ -203,13 +203,17 @@ func TestQuotaSnapshotPoolRemaining(t *testing.T) {
 			Models: []ModelQuota{
 				{ModelID: "gemini-2.5-pro", RemainingFraction: 0.90, ResetAt: &t1},
 				{ModelID: "claude-sonnet-4-6", RemainingFraction: 0.35, ResetAt: &t3},
-				{ModelID: "gemini-argon", RemainingFraction: 0.50, ResetAt: &t2},
+				{ModelID: "gemini-4-argon-high", RemainingFraction: 0.50, ResetAt: &t2},
 			},
 		}
 
 		rem, resetAt, ok := snap.PoolRemaining(Pool3P)
 		if !ok || rem != 0.35 || resetAt == nil || !resetAt.Equal(t3) {
 			t.Fatalf("PoolRemaining(3p) = (%v, %v, %v), want (0.35, %v, true)", rem, resetAt, ok, t3)
+		}
+		remGem, _, okGem := snap.PoolRemaining(PoolGemini)
+		if !okGem || remGem != 0.50 {
+			t.Fatalf("PoolRemaining(gemini) = (%v, %v), want (0.50, true)", remGem, okGem)
 		}
 		remAll, _, okAll := snap.PoolRemaining("")
 		if !okAll || remAll != 0.35 {
@@ -243,8 +247,12 @@ func TestInferPoolForModel(t *testing.T) {
 		{model: "gemini-3-flash", want: PoolGemini},
 		{model: "Hydrogen (XHigh)", want: PoolGemini},
 		{model: "Neon (XHigh)", want: PoolGemini},
-		{model: "gemini-argon", want: PoolGeminiArgon},
-		{model: "gemini-3.5-argon-preview", want: PoolGeminiArgon},
+		{model: "gemini-4-argon-high", want: PoolGemini},
+		{model: "Argon (High)", want: PoolGemini},
+		{model: "Orchestrator (Argon)", want: PoolGemini},
+		{model: "gemini-4-carbon-high", want: PoolGemini},
+		{model: "Carbon (High)", want: PoolGemini},
+		{model: "Orchestrator (Carbon)", want: PoolGemini},
 		{model: "claude-sonnet-4-6", want: Pool3P},
 		{model: "Claude Sonnet 5.5 (High)", want: Pool3P},
 		{model: "gemini-claude-sonnet-4-6", want: Pool3P},
@@ -391,7 +399,8 @@ func TestClassifyPoolAndWindow(t *testing.T) {
 		{input: "Claude Opus 5.5", want: Pool3P},
 		{input: "Claude Sonnet 5.5", want: Pool3P},
 		{input: "GPT-OSS 120B", want: Pool3P},
-		{input: "Gemini 4 Argon", want: PoolGeminiArgon},
+		{input: "Gemini 4 Argon", want: PoolGemini},
+		{input: "Gemini 4 Carbon", want: PoolGemini},
 		{input: "custom-model", want: PoolOther},
 	}
 	for _, tc := range poolCases {

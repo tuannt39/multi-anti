@@ -108,12 +108,6 @@ func TestCloudCodeFetcher(t *testing.T) {
 							"resetTime":   "2026-11-24T00:00:00Z",
 						},
 						{
-							"groupId":           "gemini-argon-wtu-weekly",
-							"displayName":       "Gemini Argon",
-							"remainingFraction": 0.85,
-							"resetTime":         "2026-11-25T00:00:00Z",
-						},
-						{
 							"groupId":           "legacy-disabled",
 							"remainingFraction": 0.0,
 							"disabled":          true,
@@ -151,17 +145,14 @@ func TestCloudCodeFetcher(t *testing.T) {
 		if snap.SummaryForbidden {
 			t.Fatalf("SummaryForbidden = true, want false")
 		}
-		if len(snap.Buckets) != 5 {
-			t.Fatalf("len(Buckets) = %d, want 5 (disabled bucket excluded)", len(snap.Buckets))
+		if len(snap.Buckets) != 4 {
+			t.Fatalf("len(Buckets) = %d, want 4 (disabled bucket excluded)", len(snap.Buckets))
 		}
 		if rem, _, ok := snap.PoolRemaining(domain.PoolGemini); !ok || rem != 0.72 {
 			t.Fatalf("PoolGemini = (%v, %v), want (0.72, true)", rem, ok)
 		}
 		if rem, _, ok := snap.PoolRemaining(domain.Pool3P); !ok || rem != 0.0 {
 			t.Fatalf("Pool3P = (%v, %v), want (0.0, true)", rem, ok)
-		}
-		if rem, _, ok := snap.PoolRemaining(domain.PoolGeminiArgon); !ok || rem != 0.85 {
-			t.Fatalf("PoolGeminiArgon = (%v, %v), want (0.85, true)", rem, ok)
 		}
 	})
 
@@ -402,8 +393,8 @@ func TestCloudCodeFetcher(t *testing.T) {
 		if _, hasDisabled := byID["3p-5h"]; hasDisabled {
 			t.Fatalf("expected disabled 3p-5h bucket to be skipped")
 		}
-		if b := byID["gemini-argon-wtu-weekly"]; b.Pool != domain.PoolGeminiArgon || b.Window != domain.WindowWeekly || b.RemainingFraction != 1 {
-			t.Fatalf("gemini-argon-wtu-weekly = %+v", b)
+		if b := byID["gemini-argon-wtu-weekly"]; b.Pool != domain.PoolGemini || b.Window != domain.WindowWeekly || b.RemainingFraction != 1 {
+			t.Fatalf("gemini-argon-wtu-weekly = %+v, want PoolGemini", b)
 		}
 	})
 }

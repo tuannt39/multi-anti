@@ -38,16 +38,15 @@ const (
 type QuotaPool string
 
 const (
-	PoolGemini      QuotaPool = "gemini"
-	Pool3P          QuotaPool = "3p"
-	PoolGeminiArgon QuotaPool = "gemini-argon"
-	PoolOther       QuotaPool = "other"
+	PoolGemini QuotaPool = "gemini"
+	Pool3P     QuotaPool = "3p"
+	PoolOther  QuotaPool = "other"
 )
 
 // IsValid reports whether p is a recognized QuotaPool value.
 func (p QuotaPool) IsValid() bool {
 	switch p {
-	case PoolGemini, Pool3P, PoolGeminiArgon, PoolOther:
+	case PoolGemini, Pool3P, PoolOther:
 		return true
 	default:
 		return false
@@ -55,7 +54,7 @@ func (p QuotaPool) IsValid() bool {
 }
 
 func (p QuotaPool) isKnownForAggregate() bool {
-	return p == PoolGemini || p == Pool3P || p == PoolGeminiArgon
+	return p == PoolGemini || p == Pool3P
 }
 
 // CreditInfo records supplemental credit balance reported for an account.
@@ -100,20 +99,55 @@ type QuotaSnapshot struct {
 	FetchError       string           `json:"fetch_error,omitempty"`
 }
 
+// HasScheduledReset reports whether resetAt represents an active scheduled reset deadline.
+func HasScheduledReset(resetAt *time.Time) bool {
+	return resetAt != nil && !resetAt.IsZero() && resetAt.Unix() > 0
+}
+
+// EffectiveAt returns the effective remaining fraction and active reset deadline at now,
+// restoring remaining quota to 1.0 once a scheduled reset deadline has passed.
+func (b QuotaBucket) EffectiveAt(now time.Time) (float64, *time.Time) {
+	return effectiveWindowAt(b.RemainingFraction, b.ResetAt, now)
+}
+
+// EffectiveAt returns the effective remaining fraction and active reset deadline at now,
+// restoring remaining quota to 1.0 once a scheduled reset deadline has passed.
+func (m ModelQuota) EffectiveAt(now time.Time) (float64, *time.Time) {
+	return effectiveWindowAt(m.RemainingFraction, m.ResetAt, now)
+}
+
+func effectiveWindowAt(remaining float64, resetAt *time.Time, now time.Time) (float64, *time.Time) {
+	if !HasScheduledReset(resetAt) {
+		return remaining, nil
+	}
+	if !now.IsZero() && !resetAt.After(now) {
+		return 1.0, nil
+	}
+	t := resetAt.UTC()
+	return remaining, &t
+}
+
 type poolCandidate struct {
 	remaining float64
 	resetAt   *time.Time
 }
 
 // PoolRemaining returns the minimum remaining fraction across windows of pool,
-// or across all known pools (gemini, 3p, gemini-argon) when pool is empty.
+// or across all known pools (gemini, 3p) when pool is empty.
 func (q QuotaSnapshot) PoolRemaining(pool QuotaPool) (remaining float64, resetAt *time.Time, ok bool) {
+	return q.PoolRemainingAt(pool, time.Time{})
+}
+
+// PoolRemainingAt returns the minimum effective remaining fraction at now across windows of pool,
+// or across all known pools (gemini, 3p) when pool is empty.
+func (q QuotaSnapshot) PoolRemainingAt(pool QuotaPool, now time.Time) (remaining float64, resetAt *time.Time, ok bool) {
 	var candidates []poolCandidate
 	for _, b := range q.Buckets {
 		if matchesPool(b.Pool, pool) {
+			rem, effReset := b.EffectiveAt(now)
 			candidates = append(candidates, poolCandidate{
-				remaining: b.RemainingFraction,
-				resetAt:   b.ResetAt,
+				remaining: rem,
+				resetAt:   effReset,
 			})
 		}
 	}
@@ -127,9 +161,10 @@ func (q QuotaSnapshot) PoolRemaining(pool QuotaPool) (remaining float64, resetAt
 			inferred = classifyModelString(m.DisplayName)
 		}
 		if matchesPool(inferred, pool) {
+			rem, effReset := m.EffectiveAt(now)
 			candidates = append(candidates, poolCandidate{
-				remaining: m.RemainingFraction,
-				resetAt:   m.ResetAt,
+				remaining: rem,
+				resetAt:   effReset,
 			})
 		}
 	}
@@ -231,11 +266,7 @@ func classifyModelString(s string) QuotaPool {
 	if lower == "" {
 		return PoolOther
 	}
-	// Match argon before gemini because gemini-argon names contain both tokens,
-	// and match 3P providers before gemini because aliases like gemini-claude-* contain both.
-	if strings.Contains(lower, "argon") {
-		return PoolGeminiArgon
-	}
+	// Match 3P providers before gemini because aliases like gemini-claude-* contain both.
 	for _, sub := range []string{"claude", "anthropic", "sonnet", "opus", "haiku", "gpt", "openai", "chatgpt"} {
 		if strings.Contains(lower, sub) {
 			return Pool3P
@@ -245,7 +276,7 @@ func classifyModelString(s string) QuotaPool {
 		switch tok {
 		case "o1", "o3", "o4", "oss", "3p":
 			return Pool3P
-		case "hydrogen", "neon", "orchestrator":
+		case "argon", "carbon", "hydrogen", "neon", "orchestrator":
 			return PoolGemini
 		}
 	}

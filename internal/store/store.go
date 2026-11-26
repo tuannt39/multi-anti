@@ -17,6 +17,8 @@ import (
 // ErrNoNativeBackup is returned by RestoreNativeBackup when no native backup has been captured.
 var ErrNoNativeBackup = errors.New("no native backup recorded")
 
+const legacyPoolGeminiArgon domain.QuotaPool = "gemini-argon"
+
 // Store manages serialized persistent state and native token backups.
 type Store interface {
 	Paths() platform.Paths
@@ -141,6 +143,39 @@ func normalizeState(state *domain.StoreState) {
 		state.Accounts = make(map[domain.AccountKey]domain.Account)
 	}
 	state.Policy = backfillPolicy(state.Policy)
+	if state.Policy.TargetPool == legacyPoolGeminiArgon {
+		state.Policy.TargetPool = domain.PoolGemini
+	}
+	if state.LastSwitch != nil && state.LastSwitch.Pool == legacyPoolGeminiArgon {
+		lsCopy := *state.LastSwitch
+		lsCopy.Pool = domain.PoolGemini
+		state.LastSwitch = &lsCopy
+	}
+	for k, acc := range state.Accounts {
+		if acc.Quota == nil || len(acc.Quota.Buckets) == 0 {
+			continue
+		}
+		hasLegacy := false
+		for _, b := range acc.Quota.Buckets {
+			if b.Pool == legacyPoolGeminiArgon {
+				hasLegacy = true
+				break
+			}
+		}
+		if !hasLegacy {
+			continue
+		}
+		filtered := make([]domain.QuotaBucket, 0, len(acc.Quota.Buckets))
+		for _, b := range acc.Quota.Buckets {
+			if b.Pool != legacyPoolGeminiArgon {
+				filtered = append(filtered, b)
+			}
+		}
+		snapCopy := *acc.Quota
+		snapCopy.Buckets = filtered
+		acc.Quota = &snapCopy
+		state.Accounts[k] = acc
+	}
 }
 
 func backfillPolicy(p domain.SelectionPolicy) domain.SelectionPolicy {

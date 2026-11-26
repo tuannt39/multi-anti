@@ -163,7 +163,7 @@ func scoreAccount(
 	var poolReset *time.Time
 	hasAnyQuota := acc.Quota != nil && (len(acc.Quota.Buckets) > 0 || len(acc.Quota.Models) > 0)
 	if hasAnyQuota {
-		poolRem, poolReset, hasPoolData = acc.Quota.PoolRemaining(effectivePool)
+		poolRem, poolReset, hasPoolData = acc.Quota.PoolRemainingAt(effectivePool, now)
 		if hasPoolData {
 			score.Remaining = poolRem
 			score.ResetAt = copyTimePtr(poolReset)
