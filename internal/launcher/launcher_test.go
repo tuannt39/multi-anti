@@ -1007,7 +1007,7 @@ func TestRunNoneReadyReturnsResetHint(t *testing.T) {
 	if res.Decision.Outcome != domain.OutcomeNoneReady {
 		t.Fatalf("Decision = %+v, want OutcomeNoneReady", res.Decision)
 	}
-	if !strings.Contains(err.Error(), "2026-11-18T12:15:00Z") {
+	if !strings.Contains(err.Error(), "earliest reset in 15m at 2026-11-18T12:15:00Z") {
 		t.Fatalf("error missing reset hint: %v", err)
 	}
 }

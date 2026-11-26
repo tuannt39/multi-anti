@@ -191,11 +191,23 @@ func (h *Handler) HandleSessionStart(ctx context.Context, stdin []byte) ([]byte,
 		pool := resolveTargetPool(acc, state.Policy.TargetPool, input.ModelName)
 		remStr := "quota n/a"
 		if acc.Quota != nil {
-			if rem, _, hasPool := acc.Quota.PoolRemainingAt(pool, now); hasPool {
-				remStr = fmt.Sprintf("%d%% remaining", roundPercent(rem))
+			if rem, resetAt, hasPool := acc.Quota.PoolRemainingAt(pool, now); hasPool {
+				pct := roundPercent(rem)
+				remStr = fmt.Sprintf("%d%% remaining", pct)
+				if pct < 100 {
+					if rt, ok := domain.DescribeReset(resetAt, now, time.UTC); ok && !rt.Due {
+						remStr += ", resets in " + rt.Compact
+					}
+				}
 			}
 		}
-		status := string(acc.Health.EffectiveStatus(now))
+		eff := acc.Health.EffectiveStatus(now)
+		status := string(eff)
+		if eff == domain.HealthCooldown {
+			if rt, ok := domain.DescribeReset(acc.Health.CooldownUntil, now, time.UTC); ok && !rt.Due {
+				status = "cooldown " + rt.Compact
+			}
+		}
 		md = fmt.Sprintf("**multi-anti** active: `%s` (%s, %s) | ready: %d/%d",
 			displayAccount(acc), status, remStr, readyCount, len(state.Accounts))
 	} else {
@@ -293,12 +305,12 @@ func (h *Handler) HandleStop(ctx context.Context, stdin []byte) ([]byte, error) 
 	}
 
 	if decision.Outcome != domain.OutcomeSwitched || decision.ToKey == "" {
-		return marshalStopAllow(formatNoneReadyReason(decision))
+		return marshalStopAllow(formatNoneReadyReason(decision, now))
 	}
 
 	targetAcc, encoded, finalDecision, ok := h.prepareStopSwitchTarget(ctx, currentKey, input.ModelName, decision, now)
 	if !ok {
-		return marshalStopAllow(formatNoneReadyReason(finalDecision))
+		return marshalStopAllow(formatNoneReadyReason(finalDecision, now))
 	}
 
 	_, err = h.store.Update(ctx, func(s *domain.StoreState) error {
@@ -730,7 +742,7 @@ func formatAccountRowStatus(acc domain.Account, isActive, isNext bool, now time.
 	case domain.HealthCooldown:
 		healthStr = "cooldown"
 		if acc.Health.CooldownUntil != nil && acc.Health.CooldownUntil.After(now) {
-			healthStr += " " + formatStatusResetShort(acc.Health.CooldownUntil.Sub(now))
+			healthStr += " " + domain.FormatDurationCompact(acc.Health.CooldownUntil.Sub(now))
 		}
 	case domain.HealthNeedsReauth:
 		healthStr = "reauth"
@@ -820,13 +832,30 @@ func formatSingleOrDualWindowCell(snap *domain.QuotaSnapshot, pool domain.QuotaP
 	return formatStatusWindowReading("", slotUnknown.rem, slotUnknown.resetAt, now)
 }
 
+func truncateStatusLabel(s string, maxLen int) string {
+	if len(s) <= maxLen || maxLen <= 3 {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
 func renderStatusTable(rows []statusTableRow, now time.Time) string {
 	hasOther := false
+	hasLongStatus := false
 	for _, r := range rows {
 		if _, _, _, ok := extractPoolSlots(r.snap, domain.PoolOther, now); ok {
 			hasOther = true
-			break
 		}
+		if len(r.status) > 14 {
+			hasLongStatus = true
+		}
+	}
+
+	maxLabelLen := 30
+	if hasOther {
+		maxLabelLen = 22
+	} else if hasLongStatus {
+		maxLabelLen = 26
 	}
 
 	var buf bytes.Buffer
@@ -838,7 +867,7 @@ func renderStatusTable(rows []statusTableRow, now time.Time) string {
 	}
 
 	for _, r := range rows {
-		acctCell := r.marker + " " + sanitizeSingleLine(r.label)
+		acctCell := r.marker + " " + truncateStatusLabel(sanitizeSingleLine(r.label), maxLabelLen)
 		gemCell := FormatDualWindowCell(r.snap, domain.PoolGemini, now)
 		cpCell := FormatDualWindowCell(r.snap, domain.Pool3P, now)
 		if hasOther {
@@ -914,32 +943,15 @@ func snapshotFromStatusInput(quotaMap map[string]StatusLineQuotaBucket, now time
 func formatStatusWindowReading(prefix string, rem float64, resetAt *time.Time, now time.Time) string {
 	pct := roundPercent(rem)
 	val := fmt.Sprintf("%d%%", pct)
-	if pct == 0 && resetAt != nil && resetAt.After(now) {
-		val += "(" + formatStatusResetShort(resetAt.Sub(now)) + ")"
+	if pct < 100 {
+		if rt, ok := domain.DescribeReset(resetAt, now, time.UTC); ok && !rt.Due {
+			val += "(" + rt.Compact + ")"
+		}
 	}
 	if prefix != "" {
 		return prefix + ":" + val
 	}
 	return val
-}
-
-func formatStatusResetShort(d time.Duration) string {
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(math.Ceil(d.Seconds())))
-	}
-	totalMins := int(d / time.Minute)
-	hours := totalMins / 60
-	mins := totalMins % 60
-	if hours >= 24 {
-		return fmt.Sprintf("%dh", hours)
-	}
-	if hours > 0 && mins > 0 {
-		return fmt.Sprintf("%dh%dm", hours, mins)
-	}
-	if hours > 0 {
-		return fmt.Sprintf("%dh", hours)
-	}
-	return fmt.Sprintf("%dm", mins)
 }
 
 func applyStatusLineBuckets(acc *domain.Account, input StatusLineInput, now time.Time) (*domain.QuotaSnapshot, bool) {
@@ -1396,8 +1408,11 @@ func formatCooldownReason(errText string) string {
 	return "quota exhausted: " + cleaned
 }
 
-func formatNoneReadyReason(decision domain.SwitchDecision) string {
+func formatNoneReadyReason(decision domain.SwitchDecision, now time.Time) string {
 	if decision.EarliestReset != nil {
+		if rt, ok := domain.DescribeReset(decision.EarliestReset, now, time.UTC); ok && !rt.Due {
+			return fmt.Sprintf("multi-anti: no ready accounts available (earliest reset in %s at %s)", rt.Compact, decision.EarliestReset.UTC().Format(time.RFC3339))
+		}
 		return fmt.Sprintf("multi-anti: no ready accounts available (earliest reset: %s)", decision.EarliestReset.UTC().Format(time.RFC3339))
 	}
 	return "multi-anti: no ready accounts available"

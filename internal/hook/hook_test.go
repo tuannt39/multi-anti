@@ -243,6 +243,44 @@ func TestHandleSessionStart(t *testing.T) {
 			t.Fatalf("carol LastUsedAt = %v, want %v", got.LastUsedAt, now)
 		}
 	})
+
+	t.Run("includes active reset countdown and cooldown duration", func(t *testing.T) {
+		paths, st := setupIsolatedHookEnv(t)
+		resetAt := now.Add(4*time.Hour + 47*time.Minute)
+		cooldownUntil := now.Add(15 * time.Minute)
+		a := makeHookAccount("alice@example.com", 0.42, "tok-a", "ref-a", now.Add(time.Hour))
+		a.Health = domain.AccountHealth{
+			Status:        domain.HealthCooldown,
+			CooldownUntil: &cooldownUntil,
+			Reason:        "rate limited",
+			UpdatedAt:     now,
+		}
+		a.Quota.Buckets[0].ResetAt = &resetAt
+		writeNativeToken(t, paths, a)
+
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = a.Key
+			s.Accounts[a.Key] = a
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		h := NewHandler(HandlerConfig{Store: st, Now: func() time.Time { return now }})
+		out, err := h.HandleSessionStart(ctx, []byte(`{"conversationId":"c-reset","modelName":"gemini-2.5-pro"}`))
+		if err != nil {
+			t.Fatalf("HandleSessionStart() error = %v", err)
+		}
+
+		var parsed SessionStartOutput
+		if err := json.Unmarshal(out, &parsed); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v; raw=%s", err, out)
+		}
+		md, _ := parsed.InjectSteps[0].SystemMessage.Metadata["user_markdown"].(string)
+		if !strings.Contains(md, "cooldown 15m") || !strings.Contains(md, "42% remaining, resets in 4h47m") {
+			t.Fatalf("unexpected user_markdown with cooldown/reset: %q", md)
+		}
+	})
 }
 
 func TestHandleStop(t *testing.T) {
@@ -728,7 +766,7 @@ func TestHandleStatusLine(t *testing.T) {
 		if strings.Contains(lines[0], "ARGON") {
 			t.Fatalf("header unexpectedly contained ARGON: %q", lines[0])
 		}
-		if !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "42%/-") || !strings.HasSuffix(lines[1], "active") {
+		if !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "42%(1h)/-") || !strings.HasSuffix(lines[1], "active") {
 			t.Fatalf("unexpected row 1: %q", lines[1])
 		}
 		if !strings.HasPrefix(lines[2], "> bob@example.com") || !strings.Contains(lines[2], "90%/-") || !strings.HasSuffix(lines[2], "next") {
@@ -888,13 +926,13 @@ func TestHandleStatusLine(t *testing.T) {
 		if strings.Contains(lines[0], "ARGON") {
 			t.Fatalf("header unexpectedly contained ARGON: %q", lines[0])
 		}
-		if !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "20%/62%") || !strings.Contains(lines[1], "-/0%(158h)") || !strings.HasSuffix(lines[1], "active") {
+		if !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "20%/62%") || !strings.Contains(lines[1], "-/0%(6d14h)") || !strings.HasSuffix(lines[1], "active") {
 			t.Fatalf("unexpected active row: %q", lines[1])
 		}
 		if !strings.HasPrefix(lines[2], "> bob@example.com") || !strings.Contains(lines[2], "100%/42%") || !strings.Contains(lines[2], "100%/49%") || !strings.HasSuffix(lines[2], "next") {
 			t.Fatalf("unexpected next row: %q", lines[2])
 		}
-		if !strings.HasPrefix(lines[3], "  carol@example.com") || !strings.Contains(lines[3], "0%(3h36m)/56%") || !strings.Contains(lines[3], "-/0%(157h)") || !strings.HasSuffix(lines[3], "cooldown 3h36m") {
+		if !strings.HasPrefix(lines[3], "  carol@example.com") || !strings.Contains(lines[3], "0%(3h36m)/56%") || !strings.Contains(lines[3], "-/0%(6d13h)") || !strings.HasSuffix(lines[3], "cooldown 3h36m") {
 			t.Fatalf("unexpected cooldown row: %q", lines[3])
 		}
 		if !strings.HasPrefix(lines[4], "  dave@example.com") || !strings.Contains(lines[4], "  -  ") || !strings.HasSuffix(lines[4], "disabled") {
@@ -938,7 +976,7 @@ func TestHandleStatusLine(t *testing.T) {
 			t.Fatalf("HandleStatusLine(matching reset) error = %v", err)
 		}
 		lines := strings.Split(out, "\n")
-		if len(lines) != 2 || !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "20%/65%") {
+		if len(lines) != 2 || !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "20%(4h)/65%(5d20h)") {
 			t.Fatalf("unexpected status table after matching reset:\n%s", out)
 		}
 		stAfter, err := st.Load(ctx)
@@ -955,7 +993,7 @@ func TestHandleStatusLine(t *testing.T) {
 			t.Fatalf("HandleStatusLine(no reset) error = %v", err)
 		}
 		lines = strings.Split(out, "\n")
-		if len(lines) != 2 || !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "20%/65%") {
+		if len(lines) != 2 || !strings.HasPrefix(lines[1], "* alice@example.com") || !strings.Contains(lines[1], "20%(4h)/65%(5d20h)") {
 			t.Fatalf("unexpected status table after windowless key without reset:\n%s", out)
 		}
 		stAfter2, err := st.Load(ctx)
@@ -1176,6 +1214,84 @@ func TestHandleStatusLine(t *testing.T) {
 		stIso, _ := st.Load(ctx)
 		if stIso.ActiveKey != carol.Key {
 			t.Fatalf("isolated session cleared global ActiveKey: %q", stIso.ActiveKey)
+		}
+	})
+
+	t.Run("keeps every line under 100 chars with long emails, all active resets, and active cooldown", func(t *testing.T) {
+		paths, st := setupIsolatedHookEnv(t)
+		resetGem5h := now.Add(1*time.Hour + 52*time.Minute)
+		resetGemWk := now.Add(6*24*time.Hour + 20*time.Hour + 10*time.Minute)
+		reset3P5h := now.Add(3*time.Hour + 15*time.Minute)
+		reset3PWk := now.Add(5*24*time.Hour + 12*time.Hour)
+		cooldownUntil := now.Add(3*time.Hour + 36*time.Minute)
+
+		longActive := domain.Account{
+			Key:   "very.long.developer.account.name+active@example.com",
+			Email: "very.long.developer.account.name+active@example.com",
+			Health: domain.AccountHealth{
+				Status:        domain.HealthCooldown,
+				CooldownUntil: &cooldownUntil,
+				UpdatedAt:     now,
+			},
+			Creds: domain.AccountCredentials{RefreshToken: "ref-a", Expiry: now.Add(time.Hour)},
+			Quota: &domain.QuotaSnapshot{
+				FetchedAt: now,
+				Source:    domain.QuotaSourceSummary,
+				Tier:      domain.TierPro,
+				Buckets: []domain.QuotaBucket{
+					{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.83, ResetAt: &resetGem5h},
+					{GroupID: "gemini-wk", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.94, ResetAt: &resetGemWk},
+					{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 0.50, ResetAt: &reset3P5h},
+					{GroupID: "3p-wk", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0.75, ResetAt: &reset3PWk},
+				},
+			},
+		}
+		longStandby := domain.Account{
+			Key:    "another.extremely.long.developer.email+standby@example.com",
+			Email:  "another.extremely.long.developer.email+standby@example.com",
+			Health: domain.AccountHealth{Status: domain.HealthReady, UpdatedAt: now},
+			Creds:  domain.AccountCredentials{RefreshToken: "ref-b", Expiry: now.Add(time.Hour)},
+			Quota: &domain.QuotaSnapshot{
+				FetchedAt: now,
+				Source:    domain.QuotaSourceSummary,
+				Tier:      domain.TierPro,
+				Buckets: []domain.QuotaBucket{
+					{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.90, ResetAt: &resetGem5h},
+					{GroupID: "gemini-wk", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.95, ResetAt: &resetGemWk},
+					{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 0.88, ResetAt: &reset3P5h},
+					{GroupID: "3p-wk", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 0.92, ResetAt: &reset3PWk},
+				},
+			},
+		}
+		writeNativeToken(t, paths, longActive)
+
+		if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+			s.ActiveKey = longActive.Key
+			s.Accounts[longActive.Key] = longActive
+			s.Accounts[longStandby.Key] = longStandby
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		h := NewHandler(HandlerConfig{Store: st, Now: func() time.Time { return now }})
+		out, err := h.HandleStatusLine(ctx, []byte(`{"email":"very.long.developer.account.name+active@example.com"}`))
+		if err != nil {
+			t.Fatalf("HandleStatusLine() error = %v", err)
+		}
+		lines := strings.Split(out, "\n")
+		if len(lines) != 3 {
+			t.Fatalf("expected 3 lines, got %d:\n%s", len(lines), out)
+		}
+		for i, ln := range lines {
+			if len(ln) >= 100 {
+				t.Fatalf("line %d too wide (%d chars >= 100): %q", i, len(ln), ln)
+			}
+		}
+		if !strings.Contains(lines[1], "83%(1h52m)/94%(6d20h)") ||
+			!strings.Contains(lines[1], "50%(3h15m)/75%(5d12h)") ||
+			!strings.HasSuffix(lines[1], "active (cooldown 3h36m)") {
+			t.Fatalf("unexpected active cooldown row: %q", lines[1])
 		}
 	})
 }

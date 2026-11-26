@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"time"
 	"unicode"
@@ -102,6 +104,144 @@ type QuotaSnapshot struct {
 // HasScheduledReset reports whether resetAt represents an active scheduled reset deadline.
 func HasScheduledReset(resetAt *time.Time) bool {
 	return resetAt != nil && !resetAt.IsZero() && resetAt.Unix() > 0
+}
+
+// ResetTiming describes an active or due reset deadline relative to an observation time and display timezone.
+type ResetTiming struct {
+	At            time.Time
+	Remaining     time.Duration
+	RemainingSecs int64
+	Due           bool
+	Compact       string
+	Countdown     string
+	AtUTC         string
+	AtLocal       string
+}
+
+func formatTimestamp(t time.Time, loc *time.Location, utcLayout, localLayout string) string {
+	if loc == nil {
+		loc = time.UTC
+	}
+	inLoc := t.In(loc)
+	_, offset := inLoc.Zone()
+	if loc == time.UTC || (offset == 0 && inLoc.Location().String() == "UTC") {
+		return t.UTC().Format(utcLayout)
+	}
+	return inLoc.Format(localLayout)
+}
+
+// FormatTimestampMinute formats t to minute precision in loc, using a Z suffix for UTC.
+func FormatTimestampMinute(t time.Time, loc *time.Location) string {
+	return formatTimestamp(t, loc, "2006-01-02 15:04Z", "2006-01-02 15:04 -07:00")
+}
+
+// FormatTimestampSecond formats t to second precision in loc, using a Z suffix for UTC.
+func FormatTimestampSecond(t time.Time, loc *time.Location) string {
+	return formatTimestamp(t, loc, "2006-01-02 15:04:05Z", "2006-01-02 15:04:05 -07:00")
+}
+
+func splitDurationParts(d time.Duration) (days, hours, mins int) {
+	totalMins := int(d / time.Minute)
+	days = totalMins / (60 * 24)
+	hours = (totalMins % (60 * 24)) / 60
+	mins = totalMins % 60
+	return days, hours, mins
+}
+
+// FormatDurationCompact formats d as a terse countdown (such as 45s, 20m, 4h47m, or 5d21h).
+func FormatDurationCompact(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(math.Ceil(d.Seconds())))
+	}
+	days, hours, mins := splitDurationParts(d)
+	switch {
+	case days > 0 && hours > 0:
+		return fmt.Sprintf("%dd%dh", days, hours)
+	case days > 0:
+		return fmt.Sprintf("%dd", days)
+	case hours > 0 && mins > 0:
+		return fmt.Sprintf("%dh%dm", hours, mins)
+	case hours > 0:
+		return fmt.Sprintf("%dh", hours)
+	default:
+		return fmt.Sprintf("%dm", mins)
+	}
+}
+
+// FormatDurationCountdown formats d with spaces and days/hours/minutes precision (such as 5d 21h 59m).
+func FormatDurationCountdown(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(math.Ceil(d.Seconds())))
+	}
+	days, hours, mins := splitDurationParts(d)
+	if days > 0 {
+		if hours == 0 && mins == 0 {
+			return fmt.Sprintf("%dd", days)
+		}
+		if mins == 0 {
+			return fmt.Sprintf("%dd %dh", days, hours)
+		}
+		return fmt.Sprintf("%dd %dh %dm", days, hours, mins)
+	}
+	if hours > 0 {
+		if mins == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		return fmt.Sprintf("%dh %dm", hours, mins)
+	}
+	return fmt.Sprintf("%dm", mins)
+}
+
+// DescribeReset resolves resetAt relative to now and formats both UTC and loc timestamps.
+func DescribeReset(resetAt *time.Time, now time.Time, loc *time.Location) (ResetTiming, bool) {
+	if !HasScheduledReset(resetAt) {
+		return ResetTiming{}, false
+	}
+	if loc == nil {
+		if !now.IsZero() {
+			loc = now.Location()
+		} else {
+			loc = time.UTC
+		}
+	}
+	utc := resetAt.UTC()
+	rt := ResetTiming{
+		At:      utc,
+		AtUTC:   FormatTimestampMinute(utc, time.UTC),
+		AtLocal: FormatTimestampMinute(utc, loc),
+	}
+	if now.IsZero() {
+		return rt, true
+	}
+	if !utc.After(now) {
+		rt.Due = true
+		rt.Compact = "due"
+		rt.Countdown = "due"
+		return rt, true
+	}
+	d := utc.Sub(now)
+	rt.Remaining = d
+	rt.RemainingSecs = int64(math.Ceil(d.Seconds()))
+	rt.Compact = FormatDurationCompact(d)
+	rt.Countdown = FormatDurationCountdown(d)
+	return rt, true
+}
+
+// FormatDetail returns the combined countdown and local reset timestamp string.
+func (rt ResetTiming) FormatDetail() string {
+	if rt.Countdown == "" {
+		return rt.AtLocal
+	}
+	if rt.Due {
+		return fmt.Sprintf("due (%s)", rt.AtLocal)
+	}
+	return fmt.Sprintf("%s (%s)", rt.Countdown, rt.AtLocal)
 }
 
 // EffectiveAt returns the effective remaining fraction and active reset deadline at now,

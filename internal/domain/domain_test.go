@@ -430,3 +430,140 @@ func TestClassifyPoolAndWindow(t *testing.T) {
 		}
 	}
 }
+
+func TestDescribeResetAndFormatting(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	ict := time.FixedZone("ICT", 7*3600)
+
+	zero := time.Time{}
+	epochZero := time.Unix(0, 0).UTC()
+	for _, tc := range []struct {
+		name string
+		at   *time.Time
+	}{
+		{name: "nil", at: nil},
+		{name: "zero", at: &zero},
+		{name: "epoch-0", at: &epochZero},
+	} {
+		if rt, ok := DescribeReset(tc.at, now, ict); ok {
+			t.Fatalf("DescribeReset(%s) unexpectedly returned ok=true: %+v", tc.name, rt)
+		}
+	}
+
+	if got := FormatDurationCompact(0); got != "0s" {
+		t.Fatalf("FormatDurationCompact(0) = %q, want 0s", got)
+	}
+	if got := FormatDurationCountdown(-time.Second); got != "0s" {
+		t.Fatalf("FormatDurationCountdown(-1s) = %q, want 0s", got)
+	}
+
+	tMidnight := time.Date(2026, 11, 26, 17, 54, 0, 0, time.UTC)
+	if got := FormatTimestampMinute(tMidnight, time.UTC); got != "2026-11-26 17:54Z" {
+		t.Fatalf("FormatTimestampMinute(UTC) = %q", got)
+	}
+	if got := FormatTimestampMinute(tMidnight, ict); got != "2026-11-27 00:54 +07:00" {
+		t.Fatalf("FormatTimestampMinute(ICT) = %q", got)
+	}
+	if got := FormatTimestampSecond(tMidnight, time.UTC); got != "2026-11-26 17:54:00Z" {
+		t.Fatalf("FormatTimestampSecond(UTC) = %q", got)
+	}
+	if got := FormatTimestampSecond(tMidnight, ict); got != "2026-11-27 00:54:00 +07:00" {
+		t.Fatalf("FormatTimestampSecond(ICT) = %q", got)
+	}
+
+	midnightRT, ok := DescribeReset(&tMidnight, now, ict)
+	if !ok {
+		t.Fatal("DescribeReset(tMidnight) returned ok=false")
+	}
+	if midnightRT.AtUTC != "2026-11-26 17:54Z" || midnightRT.AtLocal != "2026-11-27 00:54 +07:00" {
+		t.Fatalf("DescribeReset(tMidnight) timestamps = %+v", midnightRT)
+	}
+	if midnightRT.FormatDetail() != "5h 54m (2026-11-27 00:54 +07:00)" {
+		t.Fatalf("midnightRT.FormatDetail() = %q", midnightRT.FormatDetail())
+	}
+
+	cases := []struct {
+		name        string
+		delta       time.Duration
+		wantCompact string
+		wantCount   string
+		wantSecs    int64
+		wantDue     bool
+		wantDetail  string
+	}{
+		{
+			name:        "45s",
+			delta:       45 * time.Second,
+			wantCompact: "45s",
+			wantCount:   "45s",
+			wantSecs:    45,
+			wantDetail:  "45s (2026-11-26 12:00Z)",
+		},
+		{
+			name:        "20m",
+			delta:       20 * time.Minute,
+			wantCompact: "20m",
+			wantCount:   "20m",
+			wantSecs:    1200,
+			wantDetail:  "20m (2026-11-26 12:20Z)",
+		},
+		{
+			name:        "4h 47m",
+			delta:       4*time.Hour + 47*time.Minute,
+			wantCompact: "4h47m",
+			wantCount:   "4h 47m",
+			wantSecs:    4*3600 + 47*60,
+			wantDetail:  "4h 47m (2026-11-26 16:47Z)",
+		},
+		{
+			name:        "5d 21h 59m",
+			delta:       5*24*time.Hour + 21*time.Hour + 59*time.Minute,
+			wantCompact: "5d21h",
+			wantCount:   "5d 21h 59m",
+			wantSecs:    5*86400 + 21*3600 + 59*60,
+			wantDetail:  "5d 21h 59m (2026-12-02 09:59Z)",
+		},
+		{
+			name:        "7d",
+			delta:       7 * 24 * time.Hour,
+			wantCompact: "7d",
+			wantCount:   "7d",
+			wantSecs:    7 * 86400,
+			wantDetail:  "7d (2026-12-03 12:00Z)",
+		},
+		{
+			name:        "due",
+			delta:       -2 * time.Minute,
+			wantCompact: "due",
+			wantCount:   "due",
+			wantSecs:    0,
+			wantDue:     true,
+			wantDetail:  "due (2026-11-26 11:58Z)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			at := now.Add(tc.delta)
+			rt, ok := DescribeReset(&at, now, time.UTC)
+			if !ok {
+				t.Fatalf("DescribeReset(%s) returned ok=false", tc.name)
+			}
+			if rt.Compact != tc.wantCompact || rt.Countdown != tc.wantCount || rt.RemainingSecs != tc.wantSecs || rt.Due != tc.wantDue {
+				t.Fatalf("DescribeReset(%s) = %+v, want compact=%q count=%q secs=%d due=%v",
+					tc.name, rt, tc.wantCompact, tc.wantCount, tc.wantSecs, tc.wantDue)
+			}
+			if got := rt.FormatDetail(); got != tc.wantDetail {
+				t.Fatalf("FormatDetail() = %q, want %q", got, tc.wantDetail)
+			}
+		})
+	}
+
+	rtZeroNow, ok := DescribeReset(&tMidnight, time.Time{}, ict)
+	if !ok || rtZeroNow.Countdown != "" || rtZeroNow.FormatDetail() != "2026-11-27 00:54 +07:00" {
+		t.Fatalf("DescribeReset(zero now) = %+v", rtZeroNow)
+	}
+}

@@ -150,7 +150,7 @@ func PrepareLaunch(
 				Now:         now,
 			})
 			if decision.Outcome == domain.OutcomeNoneReady || decision.ToKey == "" {
-				return PreparedLaunch{Decision: decision}, formatNoReadyError(decision)
+				return PreparedLaunch{Decision: decision}, formatNoReadyError(decision, now)
 			}
 			acc, ok := state.Accounts[decision.ToKey]
 			if !ok {
@@ -195,7 +195,7 @@ func PrepareLaunch(
 	}
 
 	if !selected {
-		return PreparedLaunch{Decision: decision}, formatNoReadyError(decision)
+		return PreparedLaunch{Decision: decision}, formatNoReadyError(decision, now)
 	}
 
 	var stagedPath string
@@ -484,8 +484,11 @@ func credentialsChanged(a, b domain.AccountCredentials) bool {
 	return false
 }
 
-func formatNoReadyError(decision domain.SwitchDecision) error {
+func formatNoReadyError(decision domain.SwitchDecision, now time.Time) error {
 	if decision.EarliestReset != nil {
+		if rt, ok := domain.DescribeReset(decision.EarliestReset, now, time.UTC); ok && !rt.Due {
+			return fmt.Errorf("%w (earliest reset in %s at %s)", ErrNoReadyAccounts, rt.Compact, decision.EarliestReset.UTC().Format(time.RFC3339))
+		}
 		return fmt.Errorf("%w (earliest reset: %s)", ErrNoReadyAccounts, decision.EarliestReset.UTC().Format(time.RFC3339))
 	}
 	return ErrNoReadyAccounts

@@ -23,12 +23,14 @@ const (
 
 // HealthView is the redacted JSON representation of an account's health state.
 type HealthView struct {
-	Status            domain.HealthStatus `json:"status"`
-	EffectiveStatus   domain.HealthStatus `json:"effective_status"`
-	Reason            string              `json:"reason,omitempty"`
-	CooldownUntil     *time.Time          `json:"cooldown_until,omitempty"`
-	CooldownRemaining string              `json:"cooldown_remaining,omitempty"`
-	UpdatedAt         time.Time           `json:"updated_at,omitzero"`
+	Status                   domain.HealthStatus `json:"status"`
+	EffectiveStatus          domain.HealthStatus `json:"effective_status"`
+	Reason                   string              `json:"reason,omitempty"`
+	CooldownUntil            *time.Time          `json:"cooldown_until,omitempty"`
+	CooldownUntilLocal       string              `json:"cooldown_until_local,omitempty"`
+	CooldownRemaining        string              `json:"cooldown_remaining,omitempty"`
+	CooldownRemainingSeconds *int64              `json:"cooldown_remaining_seconds,omitempty"`
+	UpdatedAt                time.Time           `json:"updated_at,omitzero"`
 }
 
 // QuotaBucketView is the JSON representation of a single quota pool bucket.
@@ -40,6 +42,9 @@ type QuotaBucketView struct {
 	RemainingFraction float64            `json:"remaining_fraction"`
 	RemainingPercent  int                `json:"remaining_percent"`
 	ResetAt           *time.Time         `json:"reset_at,omitempty"`
+	ResetAtLocal      string             `json:"reset_at_local,omitempty"`
+	ResetIn           string             `json:"reset_in,omitempty"`
+	ResetInSeconds    *int64             `json:"reset_in_seconds,omitempty"`
 }
 
 // ModelQuotaView is the JSON representation of per-model quota availability.
@@ -50,12 +55,16 @@ type ModelQuotaView struct {
 	RemainingFraction float64          `json:"remaining_fraction"`
 	RemainingPercent  int              `json:"remaining_percent"`
 	ResetAt           *time.Time       `json:"reset_at,omitempty"`
+	ResetAtLocal      string           `json:"reset_at_local,omitempty"`
+	ResetIn           string           `json:"reset_in,omitempty"`
+	ResetInSeconds    *int64           `json:"reset_in_seconds,omitempty"`
 	SupportsThinking  bool             `json:"supports_thinking,omitempty"`
 }
 
 // QuotaSnapshotView is the JSON representation of an account's quota snapshot.
 type QuotaSnapshotView struct {
 	FetchedAt        time.Time               `json:"fetched_at"`
+	FetchedAtLocal   string                  `json:"fetched_at_local,omitempty"`
 	Source           domain.QuotaSource      `json:"source,omitempty"`
 	EndpointHost     string                  `json:"endpoint_host,omitempty"`
 	Tier             domain.SubscriptionTier `json:"tier"`
@@ -68,22 +77,25 @@ type QuotaSnapshotView struct {
 
 // AccountView is a strictly redacted view of domain.Account without any OAuth tokens.
 type AccountView struct {
-	Key              domain.AccountKey       `json:"key"`
-	Email            string                  `json:"email,omitempty"`
-	AccountID        string                  `json:"account_id,omitempty"`
-	DisplayName      string                  `json:"display_name,omitempty"`
-	Active           bool                    `json:"active"`
-	Priority         int                     `json:"priority"`
-	Health           HealthView              `json:"health"`
-	Tier             domain.SubscriptionTier `json:"tier"`
-	PrimaryRemaining *float64                `json:"primary_remaining,omitempty"`
-	PrimaryResetAt   *time.Time              `json:"primary_reset_at,omitempty"`
-	HasRefreshToken  bool                    `json:"has_refresh_token"`
-	HasAccessToken   bool                    `json:"has_access_token"`
-	TokenExpiry      *time.Time              `json:"token_expiry,omitempty"`
-	AddedAt          time.Time               `json:"added_at,omitzero"`
-	LastUsedAt       *time.Time              `json:"last_used_at,omitempty"`
-	Quota            *QuotaSnapshotView      `json:"quota,omitempty"`
+	Key                   domain.AccountKey       `json:"key"`
+	Email                 string                  `json:"email,omitempty"`
+	AccountID             string                  `json:"account_id,omitempty"`
+	DisplayName           string                  `json:"display_name,omitempty"`
+	Active                bool                    `json:"active"`
+	Priority              int                     `json:"priority"`
+	Health                HealthView              `json:"health"`
+	Tier                  domain.SubscriptionTier `json:"tier"`
+	PrimaryRemaining      *float64                `json:"primary_remaining,omitempty"`
+	PrimaryResetAt        *time.Time              `json:"primary_reset_at,omitempty"`
+	PrimaryResetAtLocal   string                  `json:"primary_reset_at_local,omitempty"`
+	PrimaryResetIn        string                  `json:"primary_reset_in,omitempty"`
+	PrimaryResetInSeconds *int64                  `json:"primary_reset_in_seconds,omitempty"`
+	HasRefreshToken       bool                    `json:"has_refresh_token"`
+	HasAccessToken        bool                    `json:"has_access_token"`
+	TokenExpiry           *time.Time              `json:"token_expiry,omitempty"`
+	AddedAt               time.Time               `json:"added_at,omitzero"`
+	LastUsedAt            *time.Time              `json:"last_used_at,omitempty"`
+	Quota                 *QuotaSnapshotView      `json:"quota,omitempty"`
 }
 
 // PolicyView is the JSON representation of domain.SelectionPolicy with human-readable durations.
@@ -124,6 +136,9 @@ type QuotaAccountView struct {
 	Remaining        *float64                `json:"remaining,omitempty"`
 	RemainingPercent *int                    `json:"remaining_percent,omitempty"`
 	ResetAt          *time.Time              `json:"reset_at,omitempty"`
+	ResetAtLocal     string                  `json:"reset_at_local,omitempty"`
+	ResetIn          string                  `json:"reset_in,omitempty"`
+	ResetInSeconds   *int64                  `json:"reset_in_seconds,omitempty"`
 	RefreshedAuth    bool                    `json:"refreshed_auth,omitempty"`
 	Error            string                  `json:"error,omitempty"`
 	Quota            *QuotaSnapshotView      `json:"quota,omitempty"`
@@ -131,11 +146,12 @@ type QuotaAccountView struct {
 
 // QuotaReportView is the redacted JSON output of `quota`.
 type QuotaReportView struct {
-	GeneratedAt time.Time          `json:"generated_at"`
-	Pool        domain.QuotaPool   `json:"pool,omitempty"`
-	Refreshed   bool               `json:"refreshed"`
-	ActiveKey   domain.AccountKey  `json:"active_key,omitempty"`
-	Accounts    []QuotaAccountView `json:"accounts"`
+	GeneratedAt      time.Time          `json:"generated_at"`
+	GeneratedAtLocal string             `json:"generated_at_local,omitempty"`
+	Pool             domain.QuotaPool   `json:"pool,omitempty"`
+	Refreshed        bool               `json:"refreshed"`
+	ActiveKey        domain.AccountKey  `json:"active_key,omitempty"`
+	Accounts         []QuotaAccountView `json:"accounts"`
 }
 
 // SwitchResultView is the redacted JSON output of `switch` / `next`.
@@ -208,7 +224,21 @@ func buildPolicyView(p domain.SelectionPolicy) PolicyView {
 	}
 }
 
-func buildHealthView(h domain.AccountHealth, now time.Time) HealthView {
+func resetViewFields(resetAt *time.Time, now time.Time, displayLoc *time.Location) (atLocal, resetIn string, resetInSecs *int64) {
+	rt, ok := domain.DescribeReset(resetAt, now, displayLoc)
+	if !ok {
+		return "", "", nil
+	}
+	atLocal = rt.AtLocal
+	if rt.Countdown != "" {
+		resetIn = rt.Countdown
+		secs := rt.RemainingSecs
+		resetInSecs = &secs
+	}
+	return atLocal, resetIn, resetInSecs
+}
+
+func buildHealthView(h domain.AccountHealth, now time.Time, displayLoc *time.Location) HealthView {
 	eff := h.EffectiveStatus(now)
 	view := HealthView{
 		Status:          h.Status,
@@ -217,13 +247,18 @@ func buildHealthView(h domain.AccountHealth, now time.Time) HealthView {
 		CooldownUntil:   copyTimePtr(h.CooldownUntil),
 		UpdatedAt:       h.UpdatedAt,
 	}
-	if eff == domain.HealthCooldown && h.CooldownUntil != nil && h.CooldownUntil.After(now) {
-		view.CooldownRemaining = formatDurationShort(h.CooldownUntil.Sub(now))
+	if eff == domain.HealthCooldown {
+		if rt, ok := domain.DescribeReset(h.CooldownUntil, now, displayLoc); ok && !rt.Due {
+			view.CooldownRemaining = rt.Compact
+			view.CooldownUntilLocal = rt.AtLocal
+			secs := rt.RemainingSecs
+			view.CooldownRemainingSeconds = &secs
+		}
 	}
 	return view
 }
 
-func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterPool domain.QuotaPool, now time.Time) *QuotaSnapshotView {
+func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterPool domain.QuotaPool, now time.Time, displayLoc *time.Location) *QuotaSnapshotView {
 	if q == nil {
 		return nil
 	}
@@ -236,11 +271,15 @@ func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterP
 		SummaryForbidden: q.SummaryForbidden,
 		FetchError:       q.FetchError,
 	}
+	if !q.FetchedAt.IsZero() {
+		view.FetchedAtLocal = domain.FormatTimestampSecond(q.FetchedAt, displayLoc)
+	}
 	for _, b := range q.Buckets {
 		if filterPool != "" && b.Pool != filterPool {
 			continue
 		}
 		rem, resetAt := b.EffectiveAt(now)
+		atLocal, resetIn, resetInSecs := resetViewFields(resetAt, now, displayLoc)
 		view.Buckets = append(view.Buckets, QuotaBucketView{
 			GroupID:           b.GroupID,
 			DisplayName:       b.DisplayName,
@@ -249,6 +288,9 @@ func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterP
 			RemainingFraction: clampFraction(rem),
 			RemainingPercent:  roundPercent(rem),
 			ResetAt:           copyTimePtr(resetAt),
+			ResetAtLocal:      atLocal,
+			ResetIn:           resetIn,
+			ResetInSeconds:    resetInSecs,
 		})
 	}
 	if includeModels || len(q.Buckets) == 0 {
@@ -261,6 +303,7 @@ func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterP
 				continue
 			}
 			rem, resetAt := m.EffectiveAt(now)
+			atLocal, resetIn, resetInSecs := resetViewFields(resetAt, now, displayLoc)
 			view.Models = append(view.Models, ModelQuotaView{
 				ModelID:           m.ModelID,
 				DisplayName:       m.DisplayName,
@@ -268,6 +311,9 @@ func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterP
 				RemainingFraction: clampFraction(rem),
 				RemainingPercent:  roundPercent(rem),
 				ResetAt:           copyTimePtr(resetAt),
+				ResetAtLocal:      atLocal,
+				ResetIn:           resetIn,
+				ResetInSeconds:    resetInSecs,
 				SupportsThinking:  m.SupportsThinking,
 			})
 		}
@@ -275,10 +321,12 @@ func buildQuotaSnapshotView(q *domain.QuotaSnapshot, includeModels bool, filterP
 	return view
 }
 
-func buildAccountView(acc domain.Account, activeKey domain.AccountKey, pool domain.QuotaPool, includeQuota bool, now time.Time) AccountView {
+func buildAccountView(acc domain.Account, activeKey domain.AccountKey, pool domain.QuotaPool, includeQuota bool, now time.Time, displayLoc *time.Location) AccountView {
 	tier := domain.TierUnknown
 	var remPtr *float64
 	var resetPtr *time.Time
+	var primaryAtLocal, primaryResetIn string
+	var primaryResetInSecs *int64
 	var qView *QuotaSnapshotView
 
 	if acc.Quota != nil {
@@ -287,9 +335,12 @@ func buildAccountView(acc domain.Account, activeKey domain.AccountKey, pool doma
 			clamped := clampFraction(rem)
 			remPtr = &clamped
 			resetPtr = copyTimePtr(resetAt)
+			if resetPtr != nil {
+				primaryAtLocal, primaryResetIn, primaryResetInSecs = resetViewFields(resetPtr, now, displayLoc)
+			}
 		}
 		if includeQuota {
-			qView = buildQuotaSnapshotView(acc.Quota, false, pool, now)
+			qView = buildQuotaSnapshotView(acc.Quota, false, pool, now, displayLoc)
 		}
 	}
 
@@ -300,22 +351,25 @@ func buildAccountView(acc domain.Account, activeKey domain.AccountKey, pool doma
 	}
 
 	return AccountView{
-		Key:              acc.Key,
-		Email:            acc.Email,
-		AccountID:        acc.AccountID,
-		DisplayName:      acc.DisplayName,
-		Active:           acc.Key == activeKey,
-		Priority:         acc.Priority,
-		Health:           buildHealthView(acc.Health, now),
-		Tier:             tier,
-		PrimaryRemaining: remPtr,
-		PrimaryResetAt:   resetPtr,
-		HasRefreshToken:  strings.TrimSpace(acc.Creds.RefreshToken) != "",
-		HasAccessToken:   strings.TrimSpace(acc.Creds.AccessToken) != "",
-		TokenExpiry:      expiryPtr,
-		AddedAt:          acc.AddedAt,
-		LastUsedAt:       copyTimePtr(acc.LastUsedAt),
-		Quota:            qView,
+		Key:                   acc.Key,
+		Email:                 acc.Email,
+		AccountID:             acc.AccountID,
+		DisplayName:           acc.DisplayName,
+		Active:                acc.Key == activeKey,
+		Priority:              acc.Priority,
+		Health:                buildHealthView(acc.Health, now, displayLoc),
+		Tier:                  tier,
+		PrimaryRemaining:      remPtr,
+		PrimaryResetAt:        resetPtr,
+		PrimaryResetAtLocal:   primaryAtLocal,
+		PrimaryResetIn:        primaryResetIn,
+		PrimaryResetInSeconds: primaryResetInSecs,
+		HasRefreshToken:       strings.TrimSpace(acc.Creds.RefreshToken) != "",
+		HasAccessToken:        strings.TrimSpace(acc.Creds.AccessToken) != "",
+		TokenExpiry:           expiryPtr,
+		AddedAt:               acc.AddedAt,
+		LastUsedAt:            copyTimePtr(acc.LastUsedAt),
+		Quota:                 qView,
 	}
 }
 
@@ -327,6 +381,7 @@ func buildQuotaReportView(
 	includeModels bool,
 	refreshed bool,
 	now time.Time,
+	displayLoc *time.Location,
 ) QuotaReportView {
 	resByKey := make(map[domain.AccountKey]quota.AccountRefreshResult, len(results))
 	for _, r := range results {
@@ -334,11 +389,12 @@ func buildQuotaReportView(
 	}
 
 	report := QuotaReportView{
-		GeneratedAt: now,
-		Pool:        targetPool,
-		Refreshed:   refreshed,
-		ActiveKey:   state.ActiveKey,
-		Accounts:    make([]QuotaAccountView, 0, len(ranked)),
+		GeneratedAt:      now,
+		GeneratedAtLocal: domain.FormatTimestampSecond(now, displayLoc),
+		Pool:             targetPool,
+		Refreshed:        refreshed,
+		ActiveKey:        state.ActiveKey,
+		Accounts:         make([]QuotaAccountView, 0, len(ranked)),
 	}
 
 	for i, c := range ranked {
@@ -375,6 +431,12 @@ func buildQuotaReportView(
 			}
 		}
 
+		var resetAtLocal, resetIn string
+		var resetInSecs *int64
+		if c.ResetAt != nil {
+			resetAtLocal, resetIn, resetInSecs = resetViewFields(c.ResetAt, now, displayLoc)
+		}
+
 		report.Accounts = append(report.Accounts, QuotaAccountView{
 			Rank:             i + 1,
 			Key:              acc.Key,
@@ -384,14 +446,17 @@ func buildQuotaReportView(
 			Eligible:         c.Eligible,
 			SkipReason:       c.SkipReason,
 			Priority:         acc.Priority,
-			Health:           buildHealthView(acc.Health, now),
+			Health:           buildHealthView(acc.Health, now, displayLoc),
 			Tier:             tier,
 			Remaining:        remPtr,
 			RemainingPercent: pctPtr,
 			ResetAt:          copyTimePtr(c.ResetAt),
+			ResetAtLocal:     resetAtLocal,
+			ResetIn:          resetIn,
+			ResetInSeconds:   resetInSecs,
 			RefreshedAuth:    refreshedAuth,
 			Error:            fetchErr,
-			Quota:            buildQuotaSnapshotView(acc.Quota, includeModels, targetPool, now),
+			Quota:            buildQuotaSnapshotView(acc.Quota, includeModels, targetPool, now, displayLoc),
 		})
 	}
 	return report
@@ -440,7 +505,15 @@ func renderAccountsTable(w io.Writer, state domain.StoreState, native nativeToke
 	}
 }
 
-func renderQuotaReport(w io.Writer, report QuotaReportView, includeModels bool, now time.Time) {
+func formatResetDetail(resetAt *time.Time, now time.Time, displayLoc *time.Location) string {
+	rt, ok := domain.DescribeReset(resetAt, now, displayLoc)
+	if !ok {
+		return "-"
+	}
+	return rt.FormatDetail()
+}
+
+func renderQuotaReport(w io.Writer, report QuotaReportView, includeModels bool, now time.Time, displayLoc *time.Location) {
 	if len(report.Accounts) == 0 {
 		fmt.Fprintln(w, "No managed accounts configured. Run 'multi-anti login' or 'multi-anti import'.")
 		return
@@ -454,7 +527,7 @@ func renderQuotaReport(w io.Writer, report QuotaReportView, includeModels bool, 
 	if report.Refreshed {
 		modeLabel = "live"
 	}
-	fmt.Fprintf(w, "Quota (%s, pool=%s, %s)\n", modeLabel, poolLabel, now.UTC().Format("15:04:05Z"))
+	fmt.Fprintf(w, "Quota (%s, pool=%s, %s)\n", modeLabel, poolLabel, domain.FormatTimestampSecond(now, displayLoc))
 
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(tw, "RANK\tACT\tACCOUNT\tTIER\tHEALTH\tQUOTA\tRESET\tCREDITS\tNOTE")
@@ -473,10 +546,7 @@ func renderQuotaReport(w io.Writer, report QuotaReportView, includeModels bool, 
 		if a.RemainingPercent != nil && a.Remaining != nil {
 			quotaCell = fmt.Sprintf("%s %3d%%", renderProgressBar(*a.Remaining, defaultBarWidth), *a.RemainingPercent)
 		}
-		resetCell := formatResetCountdown(a.ResetAt, now)
-		if a.Remaining != nil && *a.Remaining >= 0.9999 {
-			resetCell = "-"
-		}
+		resetCell := formatResetDetail(a.ResetAt, now, displayLoc)
 		creditsCell := "-"
 		if a.Quota != nil && len(a.Quota.Credits) > 0 {
 			creditsCell = formatCredits(a.Quota.Credits)
@@ -497,7 +567,7 @@ func renderQuotaReport(w io.Writer, report QuotaReportView, includeModels bool, 
 	}
 	_ = tw.Flush()
 
-	renderQuotaBreakdown(w, report.Accounts, now)
+	renderQuotaBreakdown(w, report.Accounts, now, displayLoc)
 
 	if includeModels {
 		for _, a := range report.Accounts {
@@ -512,8 +582,9 @@ func renderQuotaReport(w io.Writer, report QuotaReportView, includeModels bool, 
 				if m.DisplayName != "" && !strings.EqualFold(m.DisplayName, m.ModelID) {
 					name = fmt.Sprintf("%s (%s)", m.ModelID, m.DisplayName)
 				}
-				bar := fmt.Sprintf("%s %3d%%", renderProgressBar(m.RemainingFraction, defaultBarWidth), m.RemainingPercent)
-				fmt.Fprintf(mtw, "  %s\t%s\t%s\t%s\n", name, m.Pool, bar, formatResetCountdown(m.ResetAt, now))
+				clamped := clampFraction(m.RemainingFraction)
+				bar := fmt.Sprintf("%s %6.2f%%", renderProgressBar(clamped, defaultBarWidth), clamped*100)
+				fmt.Fprintf(mtw, "  %s\t%s\t%s\t%s\n", name, poolDisplayLabel(m.Pool), bar, formatResetDetail(m.ResetAt, now, displayLoc))
 			}
 			_ = mtw.Flush()
 		}
@@ -540,7 +611,7 @@ func poolDisplayLabel(pool domain.QuotaPool) string {
 	return string(pool)
 }
 
-func renderQuotaBreakdown(w io.Writer, accounts []QuotaAccountView, now time.Time) {
+func renderQuotaBreakdown(w io.Writer, accounts []QuotaAccountView, now time.Time, displayLoc *time.Location) {
 	for _, a := range accounts {
 		if a.Quota == nil || (len(a.Quota.Buckets) == 0 && len(a.Quota.Models) == 0) {
 			continue
@@ -553,6 +624,14 @@ func renderQuotaBreakdown(w io.Writer, accounts []QuotaAccountView, now time.Tim
 		if a.Active {
 			header += " [*]"
 		}
+		if a.Health.EffectiveStatus == domain.HealthCooldown && a.Health.CooldownUntil != nil {
+			if rt, ok := domain.DescribeReset(a.Health.CooldownUntil, now, displayLoc); ok && !rt.Due {
+				header += fmt.Sprintf(" [cooldown: %s]", rt.FormatDetail())
+			}
+		}
+		if !a.Quota.FetchedAt.IsZero() && now.Sub(a.Quota.FetchedAt) >= time.Minute {
+			header += fmt.Sprintf(" (fetched %s, %s)", formatTimeRelative(&a.Quota.FetchedAt, now), domain.FormatTimestampMinute(a.Quota.FetchedAt, displayLoc))
+		}
 		fmt.Fprintf(w, "\n  %s\n", header)
 
 		bt := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
@@ -563,11 +642,19 @@ func renderQuotaBreakdown(w io.Writer, accounts []QuotaAccountView, now time.Tim
 					continue
 				}
 				sortQuotaBucketsForDisplay(poolBuckets)
-				cells := make([]string, 0, len(poolBuckets))
-				for _, b := range poolBuckets {
-					cells = append(cells, formatCompactBucketCell(b, now))
+				for idx, b := range poolBuckets {
+					poolCol := ""
+					if idx == 0 {
+						poolCol = spec.Label
+					}
+					clamped := clampFraction(b.RemainingFraction)
+					fmt.Fprintf(bt, "    %s\t%s %s %6.2f%%\t%s\n",
+						poolCol,
+						quotaWindowTag(b),
+						renderProgressBar(clamped, defaultBarWidth),
+						clamped*100,
+						formatResetDetail(b.ResetAt, now, displayLoc))
 				}
-				fmt.Fprintf(bt, "    %s\t%s\n", spec.Label, strings.Join(cells, "  |  "))
 			}
 		} else {
 			for _, m := range a.Quota.Models {
@@ -581,20 +668,11 @@ func renderQuotaBreakdown(w io.Writer, accounts []QuotaAccountView, now time.Tim
 					poolDisplayLabel(m.Pool),
 					renderProgressBar(clamped, defaultBarWidth),
 					clamped*100,
-					formatCompactReset(clamped, m.ResetAt, now))
+					formatResetDetail(m.ResetAt, now, displayLoc))
 			}
 		}
 		_ = bt.Flush()
 	}
-}
-
-func formatCompactBucketCell(b QuotaBucketView, now time.Time) string {
-	clamped := clampFraction(b.RemainingFraction)
-	return fmt.Sprintf("%s %s %6.2f%% %s",
-		quotaWindowTag(b),
-		renderProgressBar(clamped, defaultBarWidth),
-		clamped*100,
-		formatCompactReset(clamped, b.ResetAt, now))
 }
 
 func quotaWindowTag(b QuotaBucketView) string {
@@ -612,26 +690,6 @@ func quotaWindowTag(b QuotaBucketView) string {
 		}
 	}
 	return "quota"
-}
-
-func formatCompactReset(rem float64, resetAt *time.Time, now time.Time) string {
-	if rem >= 0.9999 || resetAt == nil || resetAt.IsZero() {
-		return "-"
-	}
-	if !resetAt.After(now) {
-		return "due"
-	}
-	d := resetAt.Sub(now)
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(math.Ceil(d.Seconds())))
-	}
-	totalMins := int(d / time.Minute)
-	hours := totalMins / 60
-	mins := totalMins % 60
-	if hours > 0 {
-		return fmt.Sprintf("%dh %dm", hours, mins)
-	}
-	return fmt.Sprintf("%dm", mins)
 }
 
 func filterQuotaBucketsByPool(buckets []QuotaBucketView, pool domain.QuotaPool) []QuotaBucketView {
@@ -736,59 +794,22 @@ func renderProgressBar(fraction float64, width int) string {
 	return "[" + strings.Repeat("#", filled) + strings.Repeat(".", width-filled) + "]"
 }
 
-func formatDurationShort(d time.Duration) string {
-	if d <= 0 {
-		return "0s"
-	}
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(math.Ceil(d.Seconds())))
-	}
-	totalMins := int(d / time.Minute)
-	days := totalMins / (60 * 24)
-	hours := (totalMins % (60 * 24)) / 60
-	mins := totalMins % 60
-
-	switch {
-	case days > 0 && hours > 0:
-		return fmt.Sprintf("%dd%dh", days, hours)
-	case days > 0:
-		return fmt.Sprintf("%dd", days)
-	case hours > 0 && mins > 0:
-		return fmt.Sprintf("%dh%dm", hours, mins)
-	case hours > 0:
-		return fmt.Sprintf("%dh", hours)
-	default:
-		return fmt.Sprintf("%dm", mins)
-	}
-}
-
 func formatTimeRelative(t *time.Time, now time.Time) string {
 	if t == nil || t.IsZero() {
 		return "never"
 	}
 	diff := now.Sub(*t)
 	if diff < 0 {
-		return t.UTC().Format("15:04Z")
+		return domain.FormatTimestampMinute(*t, time.UTC)
 	}
 	if diff < time.Minute {
 		return "just now"
 	}
-	return formatDurationShort(diff) + " ago"
-}
-
-func formatResetCountdown(resetAt *time.Time, now time.Time) string {
-	if resetAt == nil || resetAt.IsZero() {
-		return "-"
-	}
-	utc := resetAt.UTC()
-	if !utc.After(now) {
-		return "due (" + utc.Format("15:04Z") + ")"
-	}
-	return fmt.Sprintf("%s (%s)", formatDurationShort(utc.Sub(now)), utc.Format("15:04Z"))
+	return domain.FormatDurationCompact(diff) + " ago"
 }
 
 func formatHealthLabel(h domain.AccountHealth, now time.Time) string {
-	return formatHealthViewLabel(buildHealthView(h, now))
+	return formatHealthViewLabel(buildHealthView(h, now, time.UTC))
 }
 
 func formatHealthViewLabel(h HealthView) string {

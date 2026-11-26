@@ -215,6 +215,15 @@ func (a *App) currentTime() time.Time {
 	return a.now().UTC()
 }
 
+func (a *App) observeTime() (time.Time, *time.Location) {
+	raw := a.now()
+	loc := raw.Location()
+	if loc == nil {
+		loc = time.UTC
+	}
+	return raw.UTC(), loc
+}
+
 func (a *App) ensurePaths() (platform.Paths, error) {
 	if a.hasPaths {
 		return a.pathsData, nil
@@ -338,7 +347,7 @@ func (a *App) cmdLogin(ctx context.Context, args []string) int {
 		identity.Key = key
 	}
 
-	now := a.currentTime()
+	now, displayLoc := a.observeTime()
 	hasPriority := flagVisited(fs, "priority")
 	hasAlias := flagVisited(fs, "alias")
 
@@ -377,7 +386,7 @@ func (a *App) cmdLogin(ctx context.Context, args []string) int {
 	if *jsonOut {
 		view := ImportResultView{
 			ActiveKey: state.ActiveKey,
-			Imported:  []AccountView{buildAccountView(acc, state.ActiveKey, state.Policy.TargetPool, true, now)},
+			Imported:  []AccountView{buildAccountView(acc, state.ActiveKey, state.Policy.TargetPool, true, now, displayLoc)},
 			Warnings:  warnings,
 		}
 		if err := writeJSON(a.stdout, view); err != nil {
@@ -743,7 +752,7 @@ func (a *App) cmdImport(ctx context.Context, args []string) int {
 		return a.fail(err)
 	}
 
-	now := a.currentTime()
+	now, displayLoc := a.observeTime()
 	flagHasPriority := flagVisited(fs, "priority")
 	flagHasAlias := flagVisited(fs, "alias")
 
@@ -798,7 +807,7 @@ func (a *App) cmdImport(ctx context.Context, args []string) int {
 		views := make([]AccountView, 0, len(importedKeys))
 		for _, k := range importedKeys {
 			if acc, ok := state.Accounts[k]; ok {
-				views = append(views, buildAccountView(acc, state.ActiveKey, state.Policy.TargetPool, true, now))
+				views = append(views, buildAccountView(acc, state.ActiveKey, state.Policy.TargetPool, true, now, displayLoc))
 			}
 		}
 		view := ImportResultView{
@@ -1058,7 +1067,7 @@ func (a *App) cmdAccounts(ctx context.Context, args []string) int {
 	if err != nil {
 		return a.fail(err)
 	}
-	now := a.currentTime()
+	now, displayLoc := a.observeTime()
 	_, _ = quota.SyncNativeTokenIfFresher(ctx, st, now)
 
 	state, err := st.Load(ctx)
@@ -1070,7 +1079,7 @@ func (a *App) cmdAccounts(ctx context.Context, args []string) int {
 		keys := sortedAccountKeys(state.Accounts)
 		views := make([]AccountView, 0, len(keys))
 		for _, k := range keys {
-			views = append(views, buildAccountView(state.Accounts[k], state.ActiveKey, state.Policy.TargetPool, false, now))
+			views = append(views, buildAccountView(state.Accounts[k], state.ActiveKey, state.Policy.TargetPool, true, now, displayLoc))
 		}
 		out := AccountsListView{
 			ActiveKey: state.ActiveKey,
@@ -1130,7 +1139,7 @@ func (a *App) cmdQuota(ctx context.Context, args []string) int {
 
 	liveRefresh := !*noRefresh && !*cached
 	runOnce := func() error {
-		now := a.currentTime()
+		now, displayLoc := a.observeTime()
 		var results []quota.AccountRefreshResult
 		if liveRefresh && a.fetcher != nil {
 			res, refErr := quota.RefreshAndFetchAll(ctx, st, a.oauth, a.fetcher, nil, quota.FetchOptions{
@@ -1154,11 +1163,11 @@ func (a *App) cmdQuota(ctx context.Context, args []string) int {
 			TargetPool: evalPool,
 			Now:        now,
 		})
-		report := buildQuotaReportView(state, ranked, results, evalPool, *models, liveRefresh, now)
+		report := buildQuotaReportView(state, ranked, results, evalPool, *models, liveRefresh, now, displayLoc)
 		if *jsonOut {
 			return writeJSON(a.stdout, report)
 		}
-		renderQuotaReport(a.stdout, report, *models, now)
+		renderQuotaReport(a.stdout, report, *models, now, displayLoc)
 		return nil
 	}
 
@@ -1230,11 +1239,11 @@ func (a *App) cmdSwitch(ctx context.Context, args []string, isNext bool) int {
 		return a.fail(fmt.Errorf("ensure native backup: %w", err))
 	}
 
-	now := a.currentTime()
+	now, displayLoc := a.observeTime()
 	if len(pos) == 1 {
-		return a.switchToExplicitAccount(ctx, st, paths, pos[0], *force, *jsonOut, now)
+		return a.switchToExplicitAccount(ctx, st, paths, pos[0], *force, *jsonOut, now, displayLoc)
 	}
-	return a.switchToNextAccount(ctx, st, paths, *modelFlag, targetPool, *noRefresh, *jsonOut, now)
+	return a.switchToNextAccount(ctx, st, paths, *modelFlag, targetPool, *noRefresh, *jsonOut, now, displayLoc)
 }
 
 func (a *App) switchToExplicitAccount(
@@ -1245,6 +1254,7 @@ func (a *App) switchToExplicitAccount(
 	force bool,
 	jsonOut bool,
 	now time.Time,
+	displayLoc *time.Location,
 ) int {
 	_, _ = quota.SyncNativeTokenIfFresher(ctx, st, now)
 	state, err := st.Load(ctx)
@@ -1262,11 +1272,9 @@ func (a *App) switchToExplicitAccount(
 		return a.fail(fmt.Errorf("cannot switch to %s: account is %s (%s)", key, eff, acc.Health.Reason))
 	case domain.HealthCooldown:
 		if !force {
-			rem := ""
-			if acc.Health.CooldownUntil != nil && acc.Health.CooldownUntil.After(now) {
-				rem = fmt.Sprintf(" (resets in %s; pass --force to override)", formatDurationShort(acc.Health.CooldownUntil.Sub(now)))
-			} else {
-				rem = " (pass --force to override)"
+			rem := " (pass --force to override)"
+			if rt, ok := domain.DescribeReset(acc.Health.CooldownUntil, now, displayLoc); ok && !rt.Due {
+				rem = fmt.Sprintf(" (resets in %s at %s; pass --force to override)", rt.Compact, rt.AtLocal)
 			}
 			return a.fail(fmt.Errorf("cannot switch to %s: account is in cooldown%s", key, rem))
 		}
@@ -1323,7 +1331,7 @@ func (a *App) switchToExplicitAccount(
 			FromKey: prevActive,
 			ToKey:   key,
 			Reason:  "manual cli switch",
-			Account: ptrAccountView(buildAccountView(finalAcc, updated.ActiveKey, updated.Policy.TargetPool, false, now)),
+			Account: ptrAccountView(buildAccountView(finalAcc, updated.ActiveKey, updated.Policy.TargetPool, true, now, displayLoc)),
 		}
 		if err := writeJSON(a.stdout, view); err != nil {
 			return a.fail(err)
@@ -1344,6 +1352,7 @@ func (a *App) switchToNextAccount(
 	noRefresh bool,
 	jsonOut bool,
 	now time.Time,
+	displayLoc *time.Location,
 ) int {
 	_, _ = quota.SyncNativeTokenIfFresher(ctx, st, now)
 	if !noRefresh && a.fetcher != nil {
@@ -1457,7 +1466,7 @@ func (a *App) switchToNextAccount(
 			Pool:      decision.Pool,
 			Reason:    decision.Reason,
 			Remaining: &rem,
-			Account:   ptrAccountView(buildAccountView(finalAcc, updated.ActiveKey, decision.Pool, false, now)),
+			Account:   ptrAccountView(buildAccountView(finalAcc, updated.ActiveKey, decision.Pool, true, now, displayLoc)),
 		}
 		if err := writeJSON(a.stdout, view); err != nil {
 			return a.fail(err)
@@ -2913,7 +2922,7 @@ func resolveBinaryCommand() string {
 
 func formatNoneReadySwitchErr(decision domain.SwitchDecision, now time.Time) error {
 	if decision.EarliestReset != nil {
-		return fmt.Errorf("%w (earliest reset in %s at %s)", launcher.ErrNoReadyAccounts, formatDurationShort(decision.EarliestReset.Sub(now)), decision.EarliestReset.UTC().Format(time.RFC3339))
+		return fmt.Errorf("%w (earliest reset in %s at %s)", launcher.ErrNoReadyAccounts, domain.FormatDurationCompact(decision.EarliestReset.Sub(now)), decision.EarliestReset.UTC().Format(time.RFC3339))
 	}
 	return launcher.ErrNoReadyAccounts
 }

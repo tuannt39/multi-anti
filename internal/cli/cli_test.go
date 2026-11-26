@@ -1627,10 +1627,13 @@ func TestUsageAliasAndFullModelsAndQuotaDisplay(t *testing.T) {
 		"elobuddyvietnam@gmail.com (pro) [*]",
 		"gemini",
 		"claude/gpt",
-		"5h [#########.]  87.33% 4h 47m",
-		"wk [########..]  81.81% 141h 59m",
-		"5h [##########] 100.00% -",
-		"wk [####......]  35.91% 158h 13m",
+		"5h [#########.]  87.33%",
+		"4h 47m (2026-11-20 04:47Z)",
+		"wk [########..]  81.81%",
+		"5d 21h 59m (2026-11-25 21:59Z)",
+		"5h [##########] 100.00%  -",
+		"wk [####......]  35.91%",
+		"6d 14h 13m (2026-11-26 14:13Z)",
 	}
 	for _, want := range wantCompact {
 		if !strings.Contains(out, want) {
@@ -1705,7 +1708,7 @@ func TestUsageAliasAndFullModelsAndQuotaDisplay(t *testing.T) {
 		"Orchestrator (Neon)",
 		"gemini",
 		"62.50%",
-		"2h 15m",
+		"2h 15m (2026-11-20 02:15Z)",
 		"Claude Opus 5.5",
 		"claude/gpt",
 		"100.00%",
@@ -2608,7 +2611,7 @@ func TestExpiredQuotaWindowResetsToFullAcrossStatusLineAccountsQuotaAndSelector(
 	if rank1Line == "" || !strings.Contains(rank1Line, "86%") {
 		t.Fatalf("expected ntt.cn2.01@gmail.com ranked #1 at 86%% in quota --cached:\n%s", quotaOut)
 	}
-	if !strings.Contains(quotaOut, "5h [##########] 100.00% -") || !strings.Contains(quotaOut, "wk [#########.]  85.90%") {
+	if !strings.Contains(quotaOut, "5h [##########] 100.00%  -") || !strings.Contains(quotaOut, "wk [#########.]  85.90%") {
 		t.Fatalf("expected expired 5h reset to 100.00%% and wk at 85.90%% in quota --cached:\n%s", quotaOut)
 	}
 	if epochLine == "" {
@@ -2746,4 +2749,232 @@ func hasDoctorCheck(checks []DoctorCheckView, name string, status DoctorStatus) 
 		}
 	}
 	return false
+}
+
+func TestResetTimeFullDisplayLocalTimezoneAndJSON(t *testing.T) {
+	ctx := context.Background()
+	ict := time.FixedZone("ICT", 7*3600)
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC).In(ict)
+	_, st := setupCLIEnv(t)
+
+	gem5hReset := now.UTC().Add(5*time.Hour + 54*time.Minute)
+	gemWkReset := now.UTC().Add(6*24*time.Hour + 14*time.Hour + 13*time.Minute)
+	threeP5hReset := now.UTC().Add(1*time.Hour + 52*time.Minute)
+	cooldownUntil := now.UTC().Add(25 * time.Minute)
+	fetchedAt := now.UTC().Add(-10 * time.Minute)
+
+	alice := domain.Account{
+		Key:   "alice@example.com",
+		Email: "alice@example.com",
+		Health: domain.AccountHealth{
+			Status:        domain.HealthCooldown,
+			CooldownUntil: &cooldownUntil,
+			Reason:        "rate limited",
+			UpdatedAt:     now.UTC(),
+		},
+		Creds: domain.AccountCredentials{
+			AccessToken:  "at-alice-secret",
+			RefreshToken: "rt-alice-secret",
+			IDToken:      "id-alice-secret",
+			Expiry:       now.UTC().Add(time.Hour),
+		},
+		Quota: &domain.QuotaSnapshot{
+			FetchedAt: fetchedAt,
+			Source:    domain.QuotaSourceSummary,
+			Tier:      domain.TierPro,
+			Buckets: []domain.QuotaBucket{
+				{GroupID: "gemini-5h", Pool: domain.PoolGemini, Window: domain.Window5h, RemainingFraction: 0.72, ResetAt: &gem5hReset},
+				{GroupID: "gemini-wk", Pool: domain.PoolGemini, Window: domain.WindowWeekly, RemainingFraction: 0.85, ResetAt: &gemWkReset},
+				{GroupID: "3p-5h", Pool: domain.Pool3P, Window: domain.Window5h, RemainingFraction: 0.83, ResetAt: &threeP5hReset},
+				{GroupID: "3p-wk", Pool: domain.Pool3P, Window: domain.WindowWeekly, RemainingFraction: 1.0},
+			},
+			Models: []domain.ModelQuota{
+				{ModelID: "gemini-2.5-pro", DisplayName: "Gemini 2.5 Pro", RemainingFraction: 0.72, ResetAt: &gem5hReset},
+			},
+		},
+		AddedAt: now.UTC().Add(-24 * time.Hour),
+	}
+
+	if _, err := st.Update(ctx, func(s *domain.StoreState) error {
+		s.ActiveKey = alice.Key
+		s.Accounts[alice.Key] = alice
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cfg := Config{
+		Store:   st,
+		OAuth:   &stubOAuth{},
+		Fetcher: &stubFetcher{},
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+		Now:     func() time.Time { return now },
+	}
+
+	for _, cmd := range [][]string{{"quota", "--cached"}, {"usage", "--cached"}} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(ctx, cmd, cfg); code != 0 {
+			t.Fatalf("%v failed code=%d stderr=%s", cmd, code, stderr.String())
+		}
+		out := stdout.String()
+		for _, want := range []string{
+			"Quota (cached, pool=all, 2026-11-26 19:00:00 +07:00)",
+			"alice@example.com (pro) [*] [cooldown: 25m (2026-11-26 19:25 +07:00)] (fetched 10m ago, 2026-11-26 18:50 +07:00)",
+			"5h [#######...]  72.00%",
+			"5h 54m (2026-11-27 00:54 +07:00)",
+			"wk [#########.]  85.00%",
+			"6d 14h 13m (2026-12-03 09:13 +07:00)",
+			"5h [########..]  83.00%",
+			"1h 52m (2026-11-26 20:52 +07:00)",
+			"wk [##########] 100.00%  -",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("%v output missing %q:\n%s", cmd, want, out)
+			}
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"quota", "--cached", "--models"}, cfg); code != 0 {
+		t.Fatalf("quota --cached --models failed code=%d stderr=%s", code, stderr.String())
+	}
+	modelsOut := stdout.String()
+	if !strings.Contains(modelsOut, "gemini-2.5-pro (Gemini 2.5 Pro)") ||
+		!strings.Contains(modelsOut, "72.00%") ||
+		!strings.Contains(modelsOut, "5h 54m (2026-11-27 00:54 +07:00)") {
+		t.Fatalf("quota --cached --models missing local reset detail:\n%s", modelsOut)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"accounts"}, cfg); code != 0 {
+		t.Fatalf("accounts failed code=%d stderr=%s", code, stderr.String())
+	}
+	accOut := stdout.String()
+	for _, want := range []string{"cooldown (25m)", "72%(5h54m)/85%(6d14h)", "83%(1h52m)/100%"} {
+		if !strings.Contains(accOut, want) {
+			t.Fatalf("accounts output missing %q:\n%s", want, accOut)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"switch", "alice@example.com"}, cfg); code == 0 {
+		t.Fatalf("expected cooldown switch refusal, got code=0")
+	} else if !strings.Contains(stderr.String(), "resets in 25m at 2026-11-26 19:25 +07:00") {
+		t.Fatalf("switch cooldown refusal missing local timestamp: %s", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"quota", "--cached", "--models", "--json"}, cfg); code != 0 {
+		t.Fatalf("quota --json failed code=%d stderr=%s", code, stderr.String())
+	}
+	quotaJSONRaw := stdout.String()
+	assertNoSecrets(t, quotaJSONRaw, "at-alice-secret", "rt-alice-secret", "id-alice-secret")
+
+	var qReport struct {
+		GeneratedAtLocal string `json:"generated_at_local"`
+		Accounts         []struct {
+			ResetAtLocal string `json:"reset_at_local"`
+			ResetIn      string `json:"reset_in"`
+			ResetInSecs  *int64 `json:"reset_in_seconds"`
+			Health       struct {
+				CooldownUntilLocal       string `json:"cooldown_until_local"`
+				CooldownRemaining        string `json:"cooldown_remaining"`
+				CooldownRemainingSeconds *int64 `json:"cooldown_remaining_seconds"`
+			} `json:"health"`
+			Quota struct {
+				FetchedAtLocal string `json:"fetched_at_local"`
+				Buckets        []struct {
+					GroupID      string `json:"group_id"`
+					ResetAtLocal string `json:"reset_at_local"`
+					ResetIn      string `json:"reset_in"`
+					ResetInSecs  *int64 `json:"reset_in_seconds"`
+				} `json:"buckets"`
+				Models []struct {
+					ModelID      string `json:"model_id"`
+					ResetAtLocal string `json:"reset_at_local"`
+					ResetIn      string `json:"reset_in"`
+					ResetInSecs  *int64 `json:"reset_in_seconds"`
+				} `json:"models"`
+			} `json:"quota"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &qReport); err != nil {
+		t.Fatalf("unmarshal quota --json: %v\n%s", err, quotaJSONRaw)
+	}
+	if qReport.GeneratedAtLocal != "2026-11-26 19:00:00 +07:00" {
+		t.Fatalf("generated_at_local = %q", qReport.GeneratedAtLocal)
+	}
+	qa := qReport.Accounts[0]
+	if qa.ResetAtLocal != "2026-11-26 19:25 +07:00" || qa.ResetIn != "25m" || qa.ResetInSecs == nil || *qa.ResetInSecs != 1500 {
+		t.Fatalf("QuotaAccountView reset fields = %+v", qa)
+	}
+	if qa.Health.CooldownUntilLocal != "2026-11-26 19:25 +07:00" || qa.Health.CooldownRemaining != "25m" || qa.Health.CooldownRemainingSeconds == nil || *qa.Health.CooldownRemainingSeconds != 1500 {
+		t.Fatalf("QuotaAccountView health fields = %+v", qa.Health)
+	}
+	if qa.Quota.FetchedAtLocal != "2026-11-26 18:50:00 +07:00" {
+		t.Fatalf("fetched_at_local = %q", qa.Quota.FetchedAtLocal)
+	}
+	if len(qa.Quota.Buckets) != 4 ||
+		qa.Quota.Buckets[0].ResetAtLocal != "2026-11-27 00:54 +07:00" ||
+		qa.Quota.Buckets[0].ResetIn != "5h 54m" ||
+		qa.Quota.Buckets[0].ResetInSecs == nil || *qa.Quota.Buckets[0].ResetInSecs != 5*3600+54*60 {
+		t.Fatalf("unexpected quota.buckets[0]: %+v", qa.Quota.Buckets)
+	}
+	if len(qa.Quota.Models) != 1 ||
+		qa.Quota.Models[0].ResetAtLocal != "2026-11-27 00:54 +07:00" ||
+		qa.Quota.Models[0].ResetIn != "5h 54m" ||
+		qa.Quota.Models[0].ResetInSecs == nil || *qa.Quota.Models[0].ResetInSecs != 5*3600+54*60 {
+		t.Fatalf("unexpected quota.models[0]: %+v", qa.Quota.Models)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(ctx, []string{"accounts", "--json"}, cfg); code != 0 {
+		t.Fatalf("accounts --json failed code=%d stderr=%s", code, stderr.String())
+	}
+	accJSONRaw := stdout.String()
+	assertNoSecrets(t, accJSONRaw, "at-alice-secret", "rt-alice-secret", "id-alice-secret")
+
+	var accList struct {
+		Accounts []struct {
+			PrimaryResetAtLocal   string `json:"primary_reset_at_local"`
+			PrimaryResetIn        string `json:"primary_reset_in"`
+			PrimaryResetInSeconds *int64 `json:"primary_reset_in_seconds"`
+			Health                struct {
+				CooldownUntilLocal       string `json:"cooldown_until_local"`
+				CooldownRemainingSeconds *int64 `json:"cooldown_remaining_seconds"`
+			} `json:"health"`
+			Quota *struct {
+				FetchedAtLocal string `json:"fetched_at_local"`
+				Buckets        []struct {
+					GroupID      string `json:"group_id"`
+					ResetAtLocal string `json:"reset_at_local"`
+					ResetIn      string `json:"reset_in"`
+				} `json:"buckets"`
+			} `json:"quota"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &accList); err != nil {
+		t.Fatalf("unmarshal accounts --json: %v\n%s", err, accJSONRaw)
+	}
+	if len(accList.Accounts) != 1 {
+		t.Fatalf("accounts len = %d, want 1", len(accList.Accounts))
+	}
+	av := accList.Accounts[0]
+	if av.PrimaryResetAtLocal != "2026-11-27 00:54 +07:00" || av.PrimaryResetIn != "5h 54m" || av.PrimaryResetInSeconds == nil || *av.PrimaryResetInSeconds != 5*3600+54*60 {
+		t.Fatalf("AccountView primary reset fields = %+v", av)
+	}
+	if av.Health.CooldownUntilLocal != "2026-11-26 19:25 +07:00" || av.Health.CooldownRemainingSeconds == nil || *av.Health.CooldownRemainingSeconds != 1500 {
+		t.Fatalf("AccountView health fields = %+v", av.Health)
+	}
+	if av.Quota == nil || av.Quota.FetchedAtLocal != "2026-11-26 18:50:00 +07:00" || len(av.Quota.Buckets) != 4 {
+		t.Fatalf("accounts --json missing full quota.buckets: %+v", av.Quota)
+	}
 }
